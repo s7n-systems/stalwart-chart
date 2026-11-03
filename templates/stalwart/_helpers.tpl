@@ -148,7 +148,7 @@ maxUnavailable: {{ .maxUnavailable }}
 {{- fail "blobStore.s3 requires existingSecret, or both accessKeyId and secretKey" -}}
 {{- end -}}
 {{- if and (eq (include "stalwart.cliCredentialsNeeded" .) "true") (not .Values.provisioning.existingSecret) (not .Values.provisioning.password) -}}
-{{- fail "provisioning.existingSecret or provisioning.password is required when S3 blob-store, metrics, email, OIDC or extra provisioning, console logging, or certificateReload is enabled" -}}
+{{- fail "provisioning.existingSecret or provisioning.password is required when S3 blob-store, metrics, encryption, OIDC or extra provisioning, console logging, or certificateReload is enabled" -}}
 {{- end -}}
 {{- if and (eq .Values.coordinator.type "nats") (not .Values.coordinator.nats.hosts) -}}
 {{- fail "coordinator.nats.hosts is required when coordinator.type=nats" -}}
@@ -229,10 +229,10 @@ true
 {{- dict "@type" "update" "object" "Metrics" "value" (dict "prometheus" $prometheus) | toJson -}}
 {{- end -}}
 
-{{/* Declares the Email singleton's encryption-at-rest toggles as-is;
-     these already match Stalwart's own defaults. */}}
-{{- define "stalwart.emailPlan" -}}
-{{- dict "@type" "update" "object" "Email" "value" (dict "encryptAtRest" .Values.email.encryptAtRest "encryptOnAppend" .Values.email.encryptOnAppend) | toJson -}}
+{{/* The server-wide encryption-at-rest switch of the Encryption singleton
+     (Stalwart 1.0.2; it replaced Email.encryptAtRest). */}}
+{{- define "stalwart.encryptionPlan" -}}
+{{- dict "@type" "update" "object" "Encryption" "value" (dict "atRestEnable" .Values.encryption.atRestEnable) | toJson -}}
 {{- end -}}
 
 {{/* Stalwart serializes Set<T> fields as objects of value->true (e.g.
@@ -391,7 +391,7 @@ true
 
 {{/* True when the CLI apply Job has at least one plan line to run. */}}
 {{- define "stalwart.provisioningEnabled" -}}
-{{- if or (eq .Values.blobStore.backend "s3") (and .Values.metrics.enabled .Values.metrics.provision) .Values.email.provision .Values.oidc.enabled .Values.inMemoryStore.type .Values.coordinator.type .Values.systemAccounts.accounts .Values.provisioning.extraPlan .Values.logging.console.enabled .Values.hostname -}}
+{{- if or (eq .Values.blobStore.backend "s3") (and .Values.metrics.enabled .Values.metrics.provision) .Values.encryption.provision .Values.oidc.enabled .Values.inMemoryStore.type .Values.coordinator.type .Values.systemAccounts.accounts .Values.provisioning.extraPlan .Values.logging.console.enabled .Values.hostname -}}
 true
 {{- end -}}
 {{- end -}}
@@ -424,8 +424,8 @@ true
 {{- if and .Values.metrics.enabled .Values.metrics.provision -}}
 {{- $lines = append $lines (include "stalwart.metricsPlan" .) -}}
 {{- end -}}
-{{- if .Values.email.provision -}}
-{{- $lines = append $lines (include "stalwart.emailPlan" .) -}}
+{{- if .Values.encryption.provision -}}
+{{- $lines = append $lines (include "stalwart.encryptionPlan" .) -}}
 {{- end -}}
 {{- if .Values.inMemoryStore.type -}}
 {{- $lines = append $lines (dict "@type" "update" "object" "InMemoryStore" "value" (dict "@type" "Redis" "url" .Values.inMemoryStore.redis.url) | toJson) -}}

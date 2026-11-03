@@ -102,7 +102,7 @@ Copy the example to `my-values.yaml`, set the database host, bucket, `hostname` 
 
 ```sh
 helm upgrade --install stalwart oci://ghcr.io/s7n-systems/charts/stalwart \
-  --version 0.2.1 --namespace stalwart -f my-values.yaml --timeout 15m
+  --version 0.3.0 --namespace stalwart -f my-values.yaml --timeout 15m
 ```
 
 The chart validates required storage settings and credential references before rendering. It cannot check whether referenced Secrets exist or whether external services are reachable; these failures can still leave an incomplete installation. To install from a checkout instead, use `.` as the chart: Bitnami Common is vendored in `charts/`, so no dependency download is needed.
@@ -112,7 +112,7 @@ The chart validates required storage settings and credential references before r
 Release builds are signed keylessly with cosign 3 from this repository's release workflow. Cosign 3 stores the signature as an OCI referrer in the new bundle format; verify with cosign 3 or newer (cosign 2 reports "no signatures found"):
 
 ```sh
-cosign verify ghcr.io/s7n-systems/charts/stalwart:0.2.1 \
+cosign verify ghcr.io/s7n-systems/charts/stalwart:0.3.0 \
   --certificate-identity-regexp '^https://github\.com/s7n-systems/stalwart-chart/\.github/workflows/release\.yml@' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
@@ -122,7 +122,7 @@ cosign verify ghcr.io/s7n-systems/charts/stalwart:0.2.1 \
 For an interactive first-time setup, use recovery mode, which suspends mail services and opens only the management listener. You can instead provision domains and other settings through `provisioning.extraPlan` during a normal installation.
 
 ```sh
-helm upgrade --install stalwart oci://ghcr.io/s7n-systems/charts/stalwart --version 0.2.1 \
+helm upgrade --install stalwart oci://ghcr.io/s7n-systems/charts/stalwart --version 0.3.0 \
   --namespace stalwart -f my-values.yaml --set recoveryMode.enabled=true --timeout 15m
 kubectl --namespace stalwart port-forward svc/stalwart-management 8080:8080
 ```
@@ -176,7 +176,7 @@ The chart applies these settings with a `stalwart-cli apply` Job after every ins
 | `hostname` | Sets the server hostname and default domain (`mailDomain`, default `domain`) |
 | `logging.console.enabled` (default) | Logs to stdout and disables the default log file |
 | `metrics.enabled`, `metrics.provision` | Enables the Prometheus exporter |
-| `email.provision` | Applies `encryptAtRest` and `encryptOnAppend` |
+| `encryption.provision` | Applies the server-wide encryption-at-rest switch (`encryption.atRestEnable`) |
 | `oidc.enabled` | Declares an OIDC directory; `oidc.activate` switches authentication to it |
 | `systemAccounts.accounts` | Creates system accounts; the reconcile Job writes their app passwords, see [System accounts](#system-accounts) |
 | `inMemoryStore.type` | Configures the shared in-memory store |
@@ -336,7 +336,7 @@ Stalwart validates bearer tokens without a client secret. The token audience mus
 
 External-directory accounts use app passwords for IMAP and SMTP; administrators cannot set their passwords. Accounts can be created on first OIDC login. Pre-create accounts that must receive mail before then. The chart does not provision ordinary users. Test administrator and mail-client logins before activation; the recovery administrator remains available.
 
-`email.provision: true` applies the server-wide encryption-at-rest settings. Encryption also needs each account's OpenPGP key or S/MIME certificate, and does not encrypt the S3 bucket.
+`encryption.provision: true` applies the server-wide `encryption.atRestEnable` switch (enabled by default in Stalwart). Each account must also enable encryption with a registered OpenPGP key or S/MIME certificate and choose whether to encrypt client-uploaded messages. This does not enable S3 bucket encryption.
 
 ### System accounts
 
@@ -414,7 +414,66 @@ Without `jmapServerUrl`, Bulwark uses the internal management Service, which onl
 
 `webmail.oauth` adds Bulwark's own OAuth login, with its own client ID at the identity provider. Configure a secret for a confidential client; leave `existingSecret` and `clientSecret` empty for a public PKCE client. It is separate from Stalwart's `oidc` token validation and defaults its issuer to `oidc.issuerUrl`. `adminPassword` protects Bulwark's local admin dashboard, which is unrelated to Stalwart accounts.
 
-For more than one webmail replica, set both `adminPassword` and `sessionSecret`, and either use `ReadWriteMany` persistence or disable persistence and settings sync. With a `ReadWriteOnce` volume the Deployment uses the `Recreate` strategy, to avoid attachment conflicts if the replacement pod is scheduled on another node. An explicit `webmail.strategy` overrides this default.
+In local mode, Bulwark keeps state in `/app/data`. Enable `webmail.persistence.enabled` to preserve admin changes and synced settings across pod replacements. The default is a 1Gi `ReadWriteOnce` volume with the `Recreate` strategy; `webmail.strategy` overrides it. **On upgrades, preserve the current PVC size** (`2Gi` for the previous default): Kubernetes cannot shrink it.
+
+Multiple replicas require `sharedStore`, `adminPassword` and `sessionSecret`. A shared filesystem cannot synchronize Bulwark's in-memory sign-in limits, leases and session revocations. Use a Redis-protocol store such as Valkey:
+
+```yaml
+webmail:
+  replicaCount: 3
+  sharedStore:
+    existingSecret: bulwark-valkey   # key REDIS_URL: redis://:<password>@valkey:6379/0
+  adminPassword:
+    existingSecret: bulwark-admin    # key ADMIN_PASSWORD
+  sessionSecret:
+    existingSecret: bulwark-session  # key SESSION_SECRET; preserve the existing value
+  settingsSync:
+    enabled: true
+  persistence:
+    enabled: false
+```
+
+The chart does not deploy the store. It holds admin config (including OAuth client secrets), plugins, branding, sessions, synced settings and sign-in limits. Configure it with:
+
+- persistence (for example, AOF on a persistent volume) and backups;
+- `maxmemory-policy noeviction`;
+- authentication and `rediss://` across untrusted networks.
+
+Stalwart's `inMemoryStore` can share the same server if it meets these requirements. Set `sharedStore.keyPrefix` per release when sharing a store. While the store is unreachable, `/api/ready` removes pods from the Service without restarting them. If the store returns empty, restore its backup; restarting all replicas initializes fresh state. Mail remains in Stalwart.
+
+#### Moving an existing installation onto a store
+
+Migrate in stages so Bulwark imports the old volume before it is detached. Disabling persistence immediately also removes the chart-managed PVC unless it was previously marked to be kept. Replace the namespace and resource names below with your release's names.
+
+1. **Back up** the webmail volume.
+2. **Keep the session secret.** Bulwark encrypts stored settings with it; a different one makes them unreadable. If `webmail.sessionSecret` is already set, keep it. Otherwise copy the generated one into a Secret and reference it:
+
+   ```sh
+   kubectl --namespace stalwart exec deploy/stalwart-webmail -- cat /app/data/admin-state/.session-secret
+   ```
+
+3. **Import with one replica**, autoscaling disabled, the old volume and an empty store. Keep the PVC size and mark it for retention:
+
+   ```yaml
+   webmail:
+     replicaCount: 1
+     autoscaling:
+       enabled: false   # otherwise replicaCount is ignored
+     sharedStore:
+       existingSecret: bulwark-valkey
+     sessionSecret:
+       existingSecret: bulwark-session
+     persistence:
+       enabled: true
+       size: 2Gi         # use the current PVC size
+       annotations:
+         helm.sh/resource-policy: keep
+   ```
+
+4. **Verify the import:** the pod log lists what it copied, and `/api/ready` reports `"store":"redis"`. Files on the volume are left unchanged.
+5. **Scale up** with `replicaCount`, or by re-enabling `autoscaling`, and `persistence.enabled: false`. The retained PVC stays as a backup; delete it with `kubectl delete pvc stalwart-webmail-data` once you no longer need it.
+
+To return to one replica without a store, run one replica with the store and `SHARED_STORE_EXPORT=1` (in `webmail.extraEnv`) on a volume: it writes the store's contents back into `/app/data` and exits. Then remove `sharedStore` and the variable.
 
 ### Scaling
 
@@ -563,9 +622,8 @@ Bitnami Common is vendored in `charts/` and updated by Renovate together with `C
 | dataStore.postgresql.username | string | `"stalwart"` |  |
 | dataStore.rocksdb.path | string | `"/var/lib/stalwart"` |  |
 | domain | string | `""` | Convenience base domain: when set and ingress.hosts / webmail.ingress.host are left at their defaults, they derive mail.<domain> and webmail.<domain> respectively. Set either explicitly to override this, or leave domain empty and set both explicitly yourself. |
-| email.encryptAtRest | bool | `true` | Encrypts messages delivered via SMTP/LMTP before they're written to disk, for any recipient with a registered key. |
-| email.encryptOnAppend | bool | `false` | Also encrypt client-appended (IMAP/JMAP) messages server-wide, overriding any per-account preference. Off by default so clients keep control, matching Stalwart's own default. |
-| email.provision | bool | `false` | Off by default: flipping it on reapplies the Email singleton via the same CLI apply Job used for blobStore/metrics, which requires provisioning credentials even if nothing else needs the Job. |
+| encryption.atRestEnable | bool | `true` | Allows server-side encryption at rest for accounts that configured it. Matches Stalwart's default; false disables this encryption for new messages. |
+| encryption.provision | bool | `false` | Reapplies atRestEnable on every install/upgrade. Requires provisioning credentials. |
 | existingSecret | string | `""` | Existing Secret containing environment variables; also accepts STALWART_RECOVERY_ADMIN. |
 | extraEnv | object | `{}` | Extra environment variables injected into the container, for non-sensitive settings. Overrides chart-generated values; extraEnvVars takes precedence. |
 | extraEnvVars | list | `[]` | Extra environment variables as Kubernetes `env` entries (for example `valueFrom.secretKeyRef`). Overrides extraEnv and chart-generated values. Names must be unique; list order is preserved. |
@@ -808,8 +866,9 @@ Bitnami Common is vendored in `charts/` and updated by Renovate together with `C
 | webmail.pdb.maxUnavailable | int | `1` | Pods that may be evicted at once. Ignored when minAvailable is set. |
 | webmail.pdb.minAvailable | string | `""` | Pods that must stay available, as a number or percentage. Replaces maxUnavailable when set; a value equal to the replica count blocks drains. |
 | webmail.persistence.accessMode | string | `"ReadWriteOnce"` |  |
+| webmail.persistence.annotations | object | `{}` | E.g. helm.sh/resource-policy: keep, so the volume survives when persistence is disabled after moving to sharedStore. |
 | webmail.persistence.enabled | bool | `false` |  |
-| webmail.persistence.size | string | `"2Gi"` |  |
+| webmail.persistence.size | string | `"1Gi"` | Local state capacity. Preserve the current PVC size on upgrades; Kubernetes cannot shrink claims (the previous default was 2Gi). |
 | webmail.persistence.storageClass | string | `""` |  |
 | webmail.podAnnotations | object | `{}` |  |
 | webmail.podAntiAffinityPreset | string | `""` | Spreads replicas across nodes when affinity is left empty: "", "soft", or "hard" -- see the top-level podAntiAffinityPreset for details. |
@@ -827,7 +886,7 @@ Bitnami Common is vendored in `charts/` and updated by Renovate together with `C
 | webmail.readinessProbe.periodSeconds | int | `10` |  |
 | webmail.readinessProbe.successThreshold | int | `1` |  |
 | webmail.readinessProbe.timeoutSeconds | int | `5` |  |
-| webmail.replicaCount | int | `1` | Multiple replicas require a pinned adminPassword and shared sessionSecret. Use ReadWriteMany persistence, or disable persistence and settingsSync. Without persistence, config and audit data are local to each replica. |
+| webmail.replicaCount | int | `1` | Multiple replicas require sharedStore, a pinned adminPassword and sessionSecret, and no ReadWriteOnce persistence; see the README for moving an existing installation onto a store. |
 | webmail.resources.requests.cpu | string | `"100m"` |  |
 | webmail.resources.requests.memory | string | `"256Mi"` |  |
 | webmail.service.annotations | object | `{}` |  |
@@ -843,6 +902,10 @@ Bitnami Common is vendored in `charts/` and updated by Renovate together with `C
 | webmail.sessionSecret.secretKey | string | `"SESSION_SECRET"` |  |
 | webmail.sessionSecret.value | string | `""` | Fallback only, stored in a chart-managed Secret and visible in Helm's release history. Prefer existingSecret. |
 | webmail.settingsSync.enabled | bool | `false` |  |
+| webmail.sharedStore.existingSecret | string | `""` | Existing Secret with the full URL, e.g. redis://:password@valkey:6379/0 (rediss:// for TLS). |
+| webmail.sharedStore.keyPrefix | string | `""` | Key prefix (REDIS_KEY_PREFIX). Empty keeps Bulwark's default "bulwark:"; set one per release when several share a store. |
+| webmail.sharedStore.secretKey | string | `"REDIS_URL"` |  |
+| webmail.sharedStore.url | string | `""` | Fallback only, stored in a chart-managed Secret, since the URL usually carries the password. Prefer existingSecret. |
 | webmail.stalwartFeatures | bool | `true` | Enables Stalwart-specific WebUI features (password change, Sieve management, vacation responder, account security, API keys, admin dashboard). Matches Bulwark's own default. |
 | webmail.startupProbe.enabled | bool | `true` |  |
 | webmail.startupProbe.failureThreshold | int | `30` |  |

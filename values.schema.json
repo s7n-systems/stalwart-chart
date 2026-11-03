@@ -1111,14 +1111,11 @@
         }
       }
     },
-    "email": {
+    "encryption": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "encryptAtRest": {
-          "type": "boolean"
-        },
-        "encryptOnAppend": {
+        "atRestEnable": {
           "type": "boolean"
         },
         "provision": {
@@ -1315,6 +1312,26 @@
           "properties": {
             "enabled": {
               "type": "boolean"
+            }
+          }
+        },
+        "sharedStore": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "existingSecret": {
+              "type": "string"
+            },
+            "secretKey": {
+              "type": "string",
+              "minLength": 1
+            },
+            "url": {
+              "type": "string",
+              "pattern": "^(rediss?://.*)?$"
+            },
+            "keyPrefix": {
+              "type": "string"
             }
           }
         },
@@ -1521,6 +1538,12 @@
             "size": {
               "type": "string",
               "minLength": 1
+            },
+            "annotations": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           }
         },

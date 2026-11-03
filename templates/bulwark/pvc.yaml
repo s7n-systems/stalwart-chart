@@ -6,6 +6,10 @@ metadata:
   namespace: {{ .Release.Namespace | quote }}
   labels:
     {{- include "stalwart.webmailLabels" . | nindent 4 }}
+  {{- with .Values.webmail.persistence.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 spec:
   accessModes:
     - {{ .Values.webmail.persistence.accessMode | quote }}

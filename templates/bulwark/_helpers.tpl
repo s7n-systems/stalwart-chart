@@ -72,6 +72,7 @@ app.kubernetes.io/component: webmail
   (and (not .Values.webmail.sessionSecret.existingSecret) .Values.webmail.sessionSecret.value)
   (and (not .Values.webmail.adminPassword.existingSecret) .Values.webmail.adminPassword.value)
   (and .Values.webmail.oauth.enabled (not .Values.webmail.oauth.existingSecret) .Values.webmail.oauth.clientSecret)
+  (and (not .Values.webmail.sharedStore.existingSecret) .Values.webmail.sharedStore.url)
 ) -}}
 true
 {{- end -}}
@@ -105,18 +106,22 @@ true
 {{- if and .Values.webmail.autoscaling.enabled (not .Values.webmail.enabled) -}}
 {{- fail "webmail.autoscaling.enabled requires webmail.enabled" -}}
 {{- end -}}
-{{- if and (gt (int (include "stalwart.webmailEffectiveMaxReplicas" .)) 1) .Values.webmail.persistence.enabled (eq .Values.webmail.persistence.accessMode "ReadWriteOnce") -}}
-{{- fail "webmail.replicaCount/autoscaling.maxReplicas > 1 requires a ReadWriteMany webmail.persistence.accessMode, or webmail.persistence.enabled=false to run without shared storage" -}}
+{{/* A shared volume cannot synchronize process-local limits, leases or session revocations. */}}
+{{- if and (gt (int (include "stalwart.webmailEffectiveMaxReplicas" .)) 1) (not (or .Values.webmail.sharedStore.existingSecret .Values.webmail.sharedStore.url)) -}}
+{{- fail "webmail.replicaCount/autoscaling.maxReplicas > 1 requires webmail.sharedStore: without it each replica keeps its own sign-in limits and admin sessions, which a shared volume does not synchronize" -}}
 {{- end -}}
-{{- if and .Values.webmail.settingsSync.enabled (not .Values.webmail.persistence.enabled) -}}
-{{- fail "webmail.settingsSync.enabled requires webmail.persistence.enabled" -}}
+{{- if and (gt (int (include "stalwart.webmailEffectiveMaxReplicas" .)) 1) .Values.webmail.persistence.enabled (eq .Values.webmail.persistence.accessMode "ReadWriteOnce") -}}
+{{- fail "webmail.replicaCount/autoscaling.maxReplicas > 1 cannot share a ReadWriteOnce volume: with webmail.sharedStore the replicas need none, so set webmail.persistence.enabled=false (after the one-replica import, see the README)" -}}
+{{- end -}}
+{{- if and .Values.webmail.settingsSync.enabled (not .Values.webmail.persistence.enabled) (not (or .Values.webmail.sharedStore.existingSecret .Values.webmail.sharedStore.url)) -}}
+{{- fail "webmail.settingsSync.enabled requires webmail.persistence.enabled or webmail.sharedStore" -}}
 {{- end -}}
 {{- if and (gt (int (include "stalwart.webmailEffectiveMaxReplicas" .)) 1) (not .Values.webmail.adminPassword.existingSecret) (not .Values.webmail.adminPassword.value) -}}
-{{- fail "webmail.replicaCount/autoscaling.maxReplicas > 1 requires webmail.adminPassword.existingSecret or .value (each replica would otherwise generate its own random password)" -}}
+{{- fail "webmail.replicaCount/autoscaling.maxReplicas > 1 requires webmail.adminPassword.existingSecret or .value (use the existing password when migrating)" -}}
 {{- end -}}
 {{- if and (gt (int (include "stalwart.webmailEffectiveMaxReplicas" .)) 1) (not .Values.webmail.sessionSecret.existingSecret) -}}
 {{- if not .Values.webmail.sessionSecret.value -}}
-{{- fail "webmail.replicaCount/autoscaling.maxReplicas > 1 requires webmail.sessionSecret.existingSecret or .value (admin session cookies require a shared SESSION_SECRET)" -}}
+{{- fail "webmail.replicaCount/autoscaling.maxReplicas > 1 requires webmail.sessionSecret.existingSecret or .value. Preserve the existing secret when migrating; see the README" -}}
 {{- else if lt (len .Values.webmail.sessionSecret.value) 32 -}}
 {{- fail "webmail.sessionSecret.value must be at least 32 characters for multi-replica admin sessions" -}}
 {{- end -}}

@@ -177,7 +177,7 @@ The chart applies these settings with a `stalwart-cli apply` Job after every ins
 | `hostname` | Sets the server hostname and default domain (`mailDomain`, default `domain`) |
 | `logging.console.enabled` (default) | Logs to stdout and disables the default log file |
 | `metrics.enabled`, `metrics.provision` | Enables the Prometheus exporter |
-| `email.provision` | Applies `encryptAtRest` and `encryptOnAppend` |
+| `encryption.provision` | Applies the server-wide encryption-at-rest switch (`encryption.atRestEnable`) |
 | `oidc.enabled` | Declares an OIDC directory; `oidc.activate` switches authentication to it |
 | `systemAccounts.accounts` | Creates system accounts; the reconcile Job writes their app passwords, see [System accounts](#system-accounts) |
 | `inMemoryStore.type` | Configures the shared in-memory store |
@@ -337,7 +337,7 @@ Stalwart validates bearer tokens without a client secret. The token audience mus
 
 External-directory accounts use app passwords for IMAP and SMTP; administrators cannot set their passwords. Accounts can be created on first OIDC login. Pre-create accounts that must receive mail before then. The chart does not provision ordinary users. Test administrator and mail-client logins before activation; the recovery administrator remains available.
 
-`email.provision: true` applies the server-wide encryption-at-rest settings. Encryption also needs each account's OpenPGP key or S/MIME certificate, and does not encrypt the S3 bucket.
+`encryption.provision: true` applies the server-wide `encryption.atRestEnable` switch (enabled by default in Stalwart). Each account must also enable encryption with a registered OpenPGP key or S/MIME certificate and choose whether to encrypt client-uploaded messages. This does not enable S3 bucket encryption.
 
 ### System accounts
 
@@ -415,7 +415,66 @@ Without `jmapServerUrl`, Bulwark uses the internal management Service, which onl
 
 `webmail.oauth` adds Bulwark's own OAuth login, with its own client ID at the identity provider. Configure a secret for a confidential client; leave `existingSecret` and `clientSecret` empty for a public PKCE client. It is separate from Stalwart's `oidc` token validation and defaults its issuer to `oidc.issuerUrl`. `adminPassword` protects Bulwark's local admin dashboard, which is unrelated to Stalwart accounts.
 
-For more than one webmail replica, set both `adminPassword` and `sessionSecret`, and either use `ReadWriteMany` persistence or disable persistence and settings sync. With a `ReadWriteOnce` volume the Deployment uses the `Recreate` strategy, to avoid attachment conflicts if the replacement pod is scheduled on another node. An explicit `webmail.strategy` overrides this default.
+In local mode, Bulwark keeps state in `/app/data`. Enable `webmail.persistence.enabled` to preserve admin changes and synced settings across pod replacements. The default is a 1Gi `ReadWriteOnce` volume with the `Recreate` strategy; `webmail.strategy` overrides it. **On upgrades, preserve the current PVC size** (`2Gi` for the previous default): Kubernetes cannot shrink it.
+
+Multiple replicas require `sharedStore`, `adminPassword` and `sessionSecret`. A shared filesystem cannot synchronize Bulwark's in-memory sign-in limits, leases and session revocations. Use a Redis-protocol store such as Valkey:
+
+```yaml
+webmail:
+  replicaCount: 3
+  sharedStore:
+    existingSecret: bulwark-valkey   # key REDIS_URL: redis://:<password>@valkey:6379/0
+  adminPassword:
+    existingSecret: bulwark-admin    # key ADMIN_PASSWORD
+  sessionSecret:
+    existingSecret: bulwark-session  # key SESSION_SECRET; preserve the existing value
+  settingsSync:
+    enabled: true
+  persistence:
+    enabled: false
+```
+
+The chart does not deploy the store. It holds admin config (including OAuth client secrets), plugins, branding, sessions, synced settings and sign-in limits. Configure it with:
+
+- persistence (for example, AOF on a persistent volume) and backups;
+- `maxmemory-policy noeviction`;
+- authentication and `rediss://` across untrusted networks.
+
+Stalwart's `inMemoryStore` can share the same server if it meets these requirements. Set `sharedStore.keyPrefix` per release when sharing a store. While the store is unreachable, `/api/ready` removes pods from the Service without restarting them. If the store returns empty, restore its backup; restarting all replicas initializes fresh state. Mail remains in Stalwart.
+
+#### Moving an existing installation onto a store
+
+Migrate in stages so Bulwark imports the old volume before it is detached. Disabling persistence immediately also removes the chart-managed PVC unless it was previously marked to be kept. Replace the namespace and resource names below with your release's names.
+
+1. **Back up** the webmail volume.
+2. **Keep the session secret.** Bulwark encrypts stored settings with it; a different one makes them unreadable. If `webmail.sessionSecret` is already set, keep it. Otherwise copy the generated one into a Secret and reference it:
+
+   ```sh
+   kubectl --namespace stalwart exec deploy/stalwart-webmail -- cat /app/data/admin-state/.session-secret
+   ```
+
+3. **Import with one replica**, autoscaling disabled, the old volume and an empty store. Keep the PVC size and mark it for retention:
+
+   ```yaml
+   webmail:
+     replicaCount: 1
+     autoscaling:
+       enabled: false   # otherwise replicaCount is ignored
+     sharedStore:
+       existingSecret: bulwark-valkey
+     sessionSecret:
+       existingSecret: bulwark-session
+     persistence:
+       enabled: true
+       size: 2Gi         # use the current PVC size
+       annotations:
+         helm.sh/resource-policy: keep
+   ```
+
+4. **Verify the import:** the pod log lists what it copied, and `/api/ready` reports `"store":"redis"`. Files on the volume are left unchanged.
+5. **Scale up** with `replicaCount`, or by re-enabling `autoscaling`, and `persistence.enabled: false`. The retained PVC stays as a backup; delete it with `kubectl delete pvc stalwart-webmail-data` once you no longer need it.
+
+To return to one replica without a store, run one replica with the store and `SHARED_STORE_EXPORT=1` (in `webmail.extraEnv`) on a volume: it writes the store's contents back into `/app/data` and exits. Then remove `sharedStore` and the variable.
 
 ### Scaling
 
