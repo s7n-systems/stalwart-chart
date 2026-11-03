@@ -387,7 +387,7 @@ class ChartChecks(unittest.TestCase):
         self.assertEqual(budgets(render({**external, 'replicaCount': 3, 'pdb': {'create': False}})), {})
 
         # Webmail has its own PDB, selecting only webmail pods.
-        webmail = {'enabled': True, 'replicaCount': 2, 'adminPassword': {'value': 'x'}, 'sessionSecret': {'existingSecret': 'webmail-session'}}
+        webmail = {'enabled': True, 'replicaCount': 2, 'adminPassword': {'value': 'x'}, 'sessionSecret': {'existingSecret': 'webmail-session'}, 'sharedStore': {'existingSecret': 'valkey-url'}}
         spec = budgets(render({'webmail': webmail}))['stalwart-webmail']
         self.assertEqual(spec['maxUnavailable'], 1)
         self.assertEqual(spec['selector']['matchLabels']['app.kubernetes.io/component'], 'webmail')
@@ -449,13 +449,63 @@ class ChartChecks(unittest.TestCase):
         render({'hostname': 'mail.example.org', 'provisioning': {'existingSecret': 'admin'}}, succeeds=False)
         render({'hostname': 'mail.example.org', 'domain': 'example.org'}, succeeds=False)
 
+    def test_webmail_shared_store(self):
+        def deployment(webmail):
+            docs = render({'webmail': {'enabled': True, **webmail}})
+            return docs, next(doc for doc in docs if doc['kind'] == 'Deployment')
+
+        def env(dep):
+            return {e['name']: e for e in dep['spec']['template']['spec']['containers'][0]['env']}
+
+        # Local mode by default: no store, and Next.js gets a writable cache.
+        docs, dep = deployment({})
+        self.assertNotIn('REDIS_URL', env(dep))
+        mounts = {m['name']: m['mountPath'] for m in dep['spec']['template']['spec']['containers'][0]['volumeMounts']}
+        self.assertEqual(mounts['next-cache'], '/app/.next/cache')
+
+        # Existing Secret, plus key prefix.
+        session = {'sessionSecret': {'existingSecret': 'session'}}
+        _, dep = deployment({**session, 'sharedStore': {'existingSecret': 'valkey-url', 'keyPrefix': 'mail:'}})
+        self.assertEqual(env(dep)['REDIS_URL']['valueFrom']['secretKeyRef'], {'name': 'valkey-url', 'key': 'REDIS_URL'})
+        self.assertEqual(env(dep)['REDIS_KEY_PREFIX']['value'], 'mail:')
+
+        # Plain URL goes into the chart-managed Secret, never into the pod spec.
+        docs, dep = deployment({**session, 'sharedStore': {'url': 'redis://:pw@valkey:6379/0'}})
+        self.assertEqual(env(dep)['REDIS_URL']['valueFrom']['secretKeyRef'], {'name': 'stalwart-webmail-env', 'key': 'redisUrl'})
+        secret = next(doc for doc in docs if doc['kind'] == 'Secret' and doc['metadata']['name'] == 'stalwart-webmail-env')
+        self.assertEqual(secret['stringData']['redisUrl'], 'redis://:pw@valkey:6379/0')
+
+        # Several replicas without any volume, and settings sync, with a store.
+        multi = {'replicaCount': 3, 'adminPassword': {'value': 'x'}, 'sessionSecret': {'existingSecret': 'session'}, 'settingsSync': {'enabled': True}, 'sharedStore': {'existingSecret': 'valkey-url'}}
+        _, dep = deployment(multi)
+        self.assertEqual(env(dep)['SETTINGS_SYNC_ENABLED']['value'], 'true')
+
+        # One replica can import its generated session secret and retain the old PVC.
+        docs, dep = deployment({'sharedStore': {'existingSecret': 'valkey-url'}, 'persistence': {'enabled': True, 'annotations': {'helm.sh/resource-policy': 'keep'}}})
+        self.assertIn('REDIS_URL', env(dep))
+        self.assertNotIn('SESSION_SECRET', env(dep))
+        pvc = next(doc for doc in docs if doc['kind'] == 'PersistentVolumeClaim')
+        self.assertEqual(pvc['metadata']['annotations'], {'helm.sh/resource-policy': 'keep'})
+        self.assertEqual(pvc['spec']['resources']['requests']['storage'], '1Gi')
+
+        for invalid in [
+            {**multi, 'sharedStore': {}},                                      # settings sync without state
+            {**multi, 'persistence': {'enabled': True}},                       # three pods on one RWO volume
+            {**session, 'sharedStore': {'url': 'valkey:6379'}},                # not a redis URL
+            {'replicaCount': 2, 'adminPassword': {'value': 'x'}, 'sessionSecret': {'existingSecret': 'session'}},  # several replicas without a store
+            {'replicaCount': 2, 'adminPassword': {'value': 'x'}, 'sessionSecret': {'existingSecret': 'session'}, 'persistence': {'enabled': True, 'accessMode': 'ReadWriteMany'}},  # RWX is no substitute
+            {**multi, 'sessionSecret': {}},                                    # several replicas without a pinned secret
+        ]:
+            with self.subTest(values=invalid):
+                render({'webmail': {'enabled': True, **invalid}}, succeeds=False)
+
     def test_webmail_autoscaling_and_anti_affinity(self):
         docs = render({'webmail': {'enabled': True}})
         self.assertFalse(any(doc['kind'] == 'HorizontalPodAutoscaler' for doc in docs))
         deployment = next(doc for doc in docs if doc['kind'] == 'Deployment')
         self.assertEqual(deployment['spec']['replicas'], 1)
 
-        docs = render({'webmail': {'enabled': True, 'adminPassword': {'value': 'x'}, 'sessionSecret': {'existingSecret': 'webmail-session'}, 'podAntiAffinityPreset': 'soft', 'autoscaling': {'enabled': True, 'maxReplicas': 4}}})
+        docs = render({'webmail': {'enabled': True, 'adminPassword': {'value': 'x'}, 'sessionSecret': {'existingSecret': 'webmail-session'}, 'sharedStore': {'existingSecret': 'valkey-url'}, 'podAntiAffinityPreset': 'soft', 'autoscaling': {'enabled': True, 'maxReplicas': 4}}})
         hpa = next(doc for doc in docs if doc['kind'] == 'HorizontalPodAutoscaler')
         self.assertEqual(hpa['metadata']['name'], 'stalwart-webmail')
         self.assertEqual(hpa['spec']['scaleTargetRef'], {'apiVersion': 'apps/v1', 'kind': 'Deployment', 'name': 'stalwart-webmail'})
@@ -618,25 +668,28 @@ class ChartChecks(unittest.TestCase):
             with self.subTest(values=invalid):
                 render(invalid, succeeds=False)
 
-    def test_email_encryption_provisioning(self):
-        # Default: email.provision is false and nothing else in this test's
+    def test_encryption_provisioning(self):
+        # Default: encryption.provision is false and nothing else in this test's
         # values triggers the Job (the render() helper defaults blobStore
         # to 'existing' for isolation), so no plan exists at all.
         docs = render({'provisioning': {'existingSecret': 'admin'}})
+        self.assertFalse(any(line['object'] == 'Encryption' for line in plan_lines(docs)))
+
+        docs = render({'provisioning': {'existingSecret': 'admin'}, 'encryption': {'provision': True}})
+        line = next(line for line in plan_lines(docs) if line['object'] == 'Encryption')
+        self.assertEqual(line, {'@type': 'update', 'object': 'Encryption', 'value': {'atRestEnable': True}})
         self.assertFalse(any(line['object'] == 'Email' for line in plan_lines(docs)))
 
-        docs = render({'provisioning': {'existingSecret': 'admin'}, 'email': {'provision': True}})
-        email_line = next(line for line in plan_lines(docs) if line['object'] == 'Email')
-        self.assertEqual(email_line, {'@type': 'update', 'object': 'Email', 'value': {'encryptAtRest': True, 'encryptOnAppend': False}})
-
-        # email.provision alone is enough to trigger the Job even with
+        # encryption.provision alone is enough to trigger the Job even with
         # everything else disabled, but still needs admin credentials.
-        docs = render({'dataStore': {'backend': 'rocksdb'}, 'blobStore': {'backend': 'existing'}, 'email': {'provision': True, 'encryptOnAppend': True}, 'provisioning': {'password': 'admin-secret'}}, raw_defaults=True)
+        docs = render({'dataStore': {'backend': 'rocksdb'}, 'blobStore': {'backend': 'existing'}, 'encryption': {'provision': True, 'atRestEnable': False}, 'provisioning': {'password': 'admin-secret'}}, raw_defaults=True)
         self.assertTrue(any(doc['kind'] == 'Job' for doc in docs))
-        email_line = next(line for line in plan_lines(docs) if line['object'] == 'Email')
-        self.assertEqual(email_line['value'], {'encryptAtRest': True, 'encryptOnAppend': True})
+        line = next(line for line in plan_lines(docs) if line['object'] == 'Encryption')
+        self.assertEqual(line['value'], {'atRestEnable': False})
 
-        render({'dataStore': {'backend': 'rocksdb'}, 'blobStore': {'backend': 'existing'}, 'email': {'provision': True}}, succeeds=False, raw_defaults=True)
+        render({'dataStore': {'backend': 'rocksdb'}, 'blobStore': {'backend': 'existing'}, 'encryption': {'provision': True}}, succeeds=False, raw_defaults=True)
+        # The pre-1.0.2 settings are rejected rather than silently ignored.
+        render({'email': {'provision': True, 'encryptAtRest': True}}, succeeds=False)
 
     def test_oidc_directory_provisioning(self):
         # Disabled by default: no Directory/Authentication lines even
@@ -718,7 +771,8 @@ class ChartChecks(unittest.TestCase):
         self.assertNotIn('SESSION_SECRET', env)
         self.assertNotIn('ADMIN_PASSWORD', env)
         self.assertNotIn('OAUTH_ENABLED', env)
-        self.assertEqual(container['livenessProbe']['httpGet'], {'path': '/api/health', 'port': 'http'})
+        self.assertEqual(container['livenessProbe']['httpGet'], {'path': '/api/health/live', 'port': 'http'})
+        self.assertEqual(container['readinessProbe']['httpGet'], {'path': '/api/ready', 'port': 'http'})
         volumes = {v['name']: v for v in deployment['spec']['template']['spec']['volumes']}
         self.assertEqual(volumes['data'], {'name': 'data', 'emptyDir': {}})
         self.assertFalse(any(doc['kind'] == 'PersistentVolumeClaim' and 'webmail' in doc['metadata']['name'] for doc in docs))
@@ -762,7 +816,7 @@ class ChartChecks(unittest.TestCase):
         self.assertNotIn('OAUTH_CLIENT_SECRET', public_env)
         self.assertFalse(any(doc['kind'] == 'Secret' and doc['metadata']['name'] == 'stalwart-webmail-env' for doc in public))
         pvc =next(doc for doc in docs if doc['kind'] == 'PersistentVolumeClaim' and doc['metadata']['name'] == 'stalwart-webmail-data')
-        self.assertEqual(pvc['spec']['resources']['requests']['storage'], '2Gi')
+        self.assertEqual(pvc['spec']['resources']['requests']['storage'], '1Gi')
         ingress = next(doc for doc in docs if doc['kind'] == 'Ingress' and doc['metadata']['name'] == 'stalwart-webmail')
         self.assertEqual(ingress['spec']['rules'][0]['host'], 'webmail.example.org')
         self.assertEqual(ingress['spec']['rules'][0]['http']['paths'][0]['backend']['service']['name'], 'stalwart-webmail')
@@ -784,7 +838,7 @@ class ChartChecks(unittest.TestCase):
     def test_webmail_multi_replica_session_secret(self):
         for scaling in [{'replicaCount': 2}, {'autoscaling': {'enabled': True, 'maxReplicas': 2}}]:
             for persistence in [{'enabled': False}, {'enabled': True, 'accessMode': 'ReadWriteMany'}]:
-                base = {'enabled': True, 'adminPassword': {'value': 'fixed-pw'}, 'persistence': persistence, **scaling}
+                base = {'enabled': True, 'adminPassword': {'value': 'fixed-pw'}, 'sharedStore': {'existingSecret': 'valkey-url'}, 'persistence': persistence, **scaling}
                 with self.subTest(scaling=scaling, persistence=persistence):
                     error = render({'webmail': base}, succeeds=False)
                     self.assertIn('requires webmail.sessionSecret.existingSecret or .value', error)
@@ -801,10 +855,9 @@ class ChartChecks(unittest.TestCase):
                             managed = next(doc for doc in docs if doc['kind'] == 'Secret' and doc['metadata']['name'] == ref['name'])
                             self.assertEqual(managed['stringData'][ref['key']], secret['value'])
 
-    def test_webmail_multi_replica_without_shared_storage(self):
-        # Ephemeral multi-replica: admin config stays writable so the dashboard
-        # initialises; shared credentials let every replica accept admin sessions.
-        docs = render({'webmail': {'enabled': True, 'replicaCount': 3, 'adminPassword': {'value': 'fixed-pw'}, 'sessionSecret': {'existingSecret': 'webmail-session'}}})
+    def test_webmail_multi_replica_without_volume(self):
+        # Shared-store replicas need no volume and can still change admin config.
+        docs = render({'webmail': {'enabled': True, 'replicaCount': 3, 'adminPassword': {'value': 'fixed-pw'}, 'sessionSecret': {'existingSecret': 'webmail-session'}, 'sharedStore': {'existingSecret': 'valkey-url'}}})
         deployment = next(doc for doc in docs if doc['kind'] == 'Deployment')
         self.assertEqual(deployment['spec']['replicas'], 3)
         env = {e['name']: e for e in deployment['spec']['template']['spec']['containers'][0]['env']}
@@ -819,17 +872,15 @@ class ChartChecks(unittest.TestCase):
         env = {e['name']: e for e in deployment['spec']['template']['spec']['containers'][0]['env']}
         self.assertEqual(env['ADMIN_CONFIG_READONLY']['value'], 'true')
 
-        # Shared RWX storage: no read-only flag either.
-        docs = render({'webmail': {
+        # Shared RWX storage without a store is rejected: it cannot share sign-in limits or admin sessions.
+        error = render({'webmail': {
             'enabled': True,
             'replicaCount': 3,
             'adminPassword': {'value': 'fixed-pw'},
             'sessionSecret': {'existingSecret': 'webmail-session'},
             'persistence': {'enabled': True, 'accessMode': 'ReadWriteMany'},
-        }})
-        deployment = next(doc for doc in docs if doc['kind'] == 'Deployment')
-        env = {e['name']: e for e in deployment['spec']['template']['spec']['containers'][0]['env']}
-        self.assertNotIn('ADMIN_CONFIG_READONLY', env)
+        }}, succeeds=False)
+        self.assertIn('requires webmail.sharedStore', error)
 
     def test_credential_value_fallback(self):
         values = {

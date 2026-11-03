@@ -33,7 +33,7 @@ metrics:
     existingSecret: "stalwart-metrics"
   serviceMonitor:
     enabled: true
-email:
+encryption:
   provision: true
 oidc:
   enabled: true
@@ -62,10 +62,13 @@ webmail:
     enabled: true
     maxReplicas: 3
   podAntiAffinityPreset: "soft"
-  persistence:
+  sharedStore:
+    existingSecret: "bulwark-valkey"
+    keyPrefix: "mail:"
+  settingsSync:
     enabled: true
-    accessMode: "ReadWriteMany"
-    storageClass: "nfs"
+  persistence:
+    enabled: false
 systemAccounts:
   smtpCheck:
     enabled: true

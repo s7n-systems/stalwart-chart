@@ -83,6 +83,22 @@ spec:
             - name: BULWARK_TELEMETRY
               value: "off"
             {{- end }}
+            {{- if (or .Values.webmail.sharedStore.existingSecret .Values.webmail.sharedStore.url) }}
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  {{- if .Values.webmail.sharedStore.existingSecret }}
+                  name: {{ .Values.webmail.sharedStore.existingSecret | quote }}
+                  key: {{ .Values.webmail.sharedStore.secretKey | quote }}
+                  {{- else }}
+                  name: {{ include "stalwart.webmailFullname" . }}-env
+                  key: redisUrl
+                  {{- end }}
+            {{- with .Values.webmail.sharedStore.keyPrefix }}
+            - name: REDIS_KEY_PREFIX
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
             {{- if or .Values.webmail.sessionSecret.existingSecret .Values.webmail.sessionSecret.value }}
             - name: SESSION_SECRET
               valueFrom:
@@ -155,21 +171,21 @@ spec:
           {{- if .Values.webmail.startupProbe.enabled }}
           startupProbe:
             httpGet:
-              path: /api/health
+              path: /api/health/live
               port: http
             {{- omit .Values.webmail.startupProbe "enabled" | toYaml | nindent 12 }}
           {{- end }}
           {{- if .Values.webmail.livenessProbe.enabled }}
           livenessProbe:
             httpGet:
-              path: /api/health
+              path: /api/health/live
               port: http
             {{- omit .Values.webmail.livenessProbe "enabled" | toYaml | nindent 12 }}
           {{- end }}
           {{- if .Values.webmail.readinessProbe.enabled }}
           readinessProbe:
             httpGet:
-              path: /api/health
+              path: /api/ready
               port: http
             {{- omit .Values.webmail.readinessProbe "enabled" | toYaml | nindent 12 }}
           {{- end }}
@@ -178,6 +194,8 @@ spec:
               mountPath: /app/data
             - name: tmp
               mountPath: /tmp
+            - name: next-cache
+              mountPath: /app/.next/cache
             {{- with .Values.webmail.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -185,6 +203,9 @@ spec:
             {{- toYaml .Values.webmail.resources | nindent 12 }}
       volumes:
         - name: tmp
+          emptyDir: {}
+        # Next.js writes its image and fetch cache here; the root filesystem is read-only.
+        - name: next-cache
           emptyDir: {}
         {{- if .Values.webmail.persistence.enabled }}
         - name: data

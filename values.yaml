@@ -38,11 +38,11 @@ image:
   repository: "stalwartlabs/stalwart"
   # -- Image tag, kept in sync with the digest by Renovate.
   # @default -- pinned, see values.yaml
-  tag: "v1.0.1"
+  tag: "v1.0.2"
   # -- Multi-arch index digest of the tag. Takes precedence over the tag;
   # clear it to float on the tag instead.
   # @default -- pinned, see values.yaml
-  digest: "sha256:b9da4df8b4efc06bc926dd6e990bdeb0ad7b9261a7c3893d74b0461a00bb389b"
+  digest: "sha256:154e55adecadfcc4a67044b9b94d482a20286e1101c97a2b322224bb596053d5"
   # -- A digest never changes, so a cached image is always the right one.
   pullPolicy: "IfNotPresent"
   pullSecrets: []
@@ -211,7 +211,7 @@ provisioning:
       # -- Multi-arch index digest of the tag. Takes precedence over the tag;
       # clear it to float on the tag instead.
       # @default -- pinned, see values.yaml
-      digest: "sha256:0aa144e9ec2ae8fd80dfd94070ef3e432a0df17b6e5e0091dc05323974ce9913"
+      digest: "sha256:20a82dbc2783112ddb91d1534603f802d222a3e63e593cd002eb2ac534e70211"
       pullPolicy: "IfNotPresent"
       pullSecrets: []
     # -- How long to wait for the restarted pods to become ready.
@@ -507,23 +507,12 @@ metrics:
     relabelings: []
     metricRelabelings: []
 
-# Server-wide message encryption at rest (per-account OpenPGP/S-MIME).
-# Both values already match Stalwart's own defaults, so this is purely
-# an explicit, auditable declaration -- it changes nothing on a server
-# that hasn't touched these settings. Actual protection still depends
-# on each account having a registered public key; that is a mailbox
-# administration task and out of scope for this chart.
-email:
-  # -- Encrypts messages delivered via SMTP/LMTP before they're written
-  # to disk, for any recipient with a registered key.
-  encryptAtRest: true
-  # -- Also encrypt client-appended (IMAP/JMAP) messages server-wide,
-  # overriding any per-account preference. Off by default so clients
-  # keep control, matching Stalwart's own default.
-  encryptOnAppend: false
-  # -- Off by default: flipping it on reapplies the Email singleton via
-  # the same CLI apply Job used for blobStore/metrics, which requires
-  # provisioning credentials even if nothing else needs the Job.
+# Accounts choose their encryption key and encryptOnAppend setting outside this chart.
+encryption:
+  # -- Allows server-side encryption at rest for accounts that configured it.
+  # Matches Stalwart's default; false disables this encryption for new messages.
+  atRestEnable: true
+  # -- Reapplies atRestEnable on every install/upgrade. Requires provisioning credentials.
   provision: false
 
 # Delegates authentication to a third-party OpenID Connect provider
@@ -629,17 +618,17 @@ webmail:
     repository: "bulwarkmail/webmail"
     # -- Image tag, kept in sync with the digest by Renovate.
     # @default -- pinned, see values.yaml
-    tag: "1.18.0"
+    tag: "1.20.0"
     # -- Multi-arch index digest of the tag. Takes precedence over the tag;
     # clear it to float on the tag instead.
     # @default -- pinned, see values.yaml
-    digest: "sha256:a985e7e40eccc70f7c7dc5d6eceaf3429ab3b644a6cf58deb240a04d39a77738"
+    digest: "sha256:df2074bd1f714f89643da127acf547d4167b4960a22cc1a3fa1570b4584ad16f"
     pullPolicy: "IfNotPresent"
     pullSecrets: []
 
-  # -- Multiple replicas require a pinned adminPassword and shared sessionSecret.
-  # Use ReadWriteMany persistence, or disable persistence and settingsSync.
-  # Without persistence, config and audit data are local to each replica.
+  # -- Multiple replicas require sharedStore, a pinned adminPassword and
+  # sessionSecret, and no ReadWriteOnce persistence; see the README for moving
+  # an existing installation onto a store.
   replicaCount: 1
 
   # -- Deployment strategy. Empty uses Recreate with a ReadWriteOnce volume,
@@ -681,23 +670,36 @@ webmail:
   # dashboard). Matches Bulwark's own default.
   stalwartFeatures: true
 
-  # Encrypts persistent sessions, settings sync, multi-account state,
-  # and server-side OAuth PKCE state. Required for anything beyond
-  # basic, non-persistent login, including admin dashboard login. Required
-  # explicitly for multiple replicas (also autoscaling.maxReplicas > 1).
-  # Use the same secret on every replica, at least 32 characters long;
-  # existing Secret contents must satisfy this too.
-  # Generate with: openssl rand -base64 32
+  # Encrypts sessions, synced settings, multi-account and OAuth PKCE state.
+  # Bulwark generates one if unset; pin it explicitly for multiple replicas.
+  # Preserve the existing secret when migrating (see README). For a new install:
+  # openssl rand -base64 32. All replicas need the same value, at least 32 characters.
   sessionSecret:
     existingSecret: ""
     secretKey: "SESSION_SECRET"
     # -- Fallback only, stored in a chart-managed Secret and visible in
     # Helm's release history. Prefer existingSecret.
     value: ""
-  # Needs real shared storage to be useful across restarts/replicas;
-  # requires persistence.enabled.
+  # Needs persistent state to be useful across restarts/replicas: requires
+  # persistence.enabled or sharedStore.
   settingsSync:
     enabled: false
+
+  # External Redis-protocol store for admin config, sessions, settings, plugins
+  # and sign-in limits (Bulwark 1.20+). Required for multiple replicas; no shared
+  # volume is needed. Use persistence, maxmemory-policy noeviction and backups.
+  # Leave both URL sources empty for local mode (/app/data). See README for migration.
+  sharedStore:
+    # -- Existing Secret with the full URL, e.g. redis://:password@valkey:6379/0
+    # (rediss:// for TLS).
+    existingSecret: ""
+    secretKey: "REDIS_URL"
+    # -- Fallback only, stored in a chart-managed Secret, since the URL usually
+    # carries the password. Prefer existingSecret.
+    url: ""
+    # -- Key prefix (REDIS_KEY_PREFIX). Empty keeps Bulwark's default
+    # "bulwark:"; set one per release when several share a store.
+    keyPrefix: ""
 
   # Explicit password for Bulwark's local admin dashboard, separate from
   # Stalwart accounts. Required by the chart when scaling above one replica.
@@ -773,16 +775,18 @@ webmail:
       # top-level domain is set; required explicitly otherwise.
       hostnames: []
 
-  # Persistent volume for /app/data (settings, admin config/state, and
-  # telemetry state). Disabling loses admin dashboard config, settings
-  # sync data, and local admin credentials/audit log on pod replacement --
-  # each replica also gets its own independent copy rather than a
-  # shared one. See replicaCount's comment for when that's fine.
+  # Keeps local /app/data (admin config, plugins, branding, audit and synced settings)
+  # across pod replacements. Multiple replicas use sharedStore instead.
   persistence:
     enabled: false
     accessMode: "ReadWriteOnce"
     storageClass: ""
-    size: "2Gi"
+    # -- Local state capacity. Preserve the current PVC size on upgrades;
+    # Kubernetes cannot shrink claims (the previous default was 2Gi).
+    size: "1Gi"
+    # -- E.g. helm.sh/resource-policy: keep, so the volume survives when
+    # persistence is disabled after moving to sharedStore.
+    annotations: {}
 
   # -- Prevent admin config writes. Requires a pre-seeded admin.json;
   # otherwise Bulwark cannot bootstrap the dashboard password.
