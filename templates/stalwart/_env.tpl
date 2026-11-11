@@ -7,6 +7,13 @@
       name: {{ .Values.recoveryAdmin.existingSecret | quote }}
       key: {{ .Values.recoveryAdmin.secretKey | quote }}
 {{- end }}
+{{- with .Values.encryption.blobKey.existingSecret }}
+- name: STALWART_BLOB_KEY
+  valueFrom:
+    secretKeyRef:
+      name: {{ . | quote }}
+      key: {{ $.Values.encryption.blobKey.secretKey | quote }}
+{{- end }}
 {{- if and .Values.metrics.enabled (or .Values.metrics.auth.existingSecret .Values.metrics.auth.password) }}
 - name: STALWART_METRICS_PASSWORD
   valueFrom:
@@ -87,22 +94,28 @@
 {{/* Same precedence as OpenCloud: extraEnvVars > extraEnv > generated values.
      Keep list order so Kubernetes can expand references to preceding variables. */}}
 {{- define "stalwart.env" -}}
-{{- $overrides := .Values.extraEnvVars | default list -}}
+{{- include "stalwart.mergeEnv" (dict "generated" (include "stalwart.generatedEnv" .) "extraEnv" .Values.extraEnv "extraEnvVars" .Values.extraEnvVars "prefix" "") -}}
+{{- end -}}
+
+{{/* generated: a YAML list of env entries; extraEnv: a name -> value map; extraEnvVars: env
+     entries; prefix: the values path for error messages. */}}
+{{- define "stalwart.mergeEnv" -}}
+{{- $overrides := .extraEnvVars | default list -}}
 {{- $names := list -}}
 {{- range $overrides -}}
 {{- if has .name $names -}}
-{{- fail (printf "extraEnvVars contains duplicate variable %q" .name) -}}
+{{- fail (printf "%sextraEnvVars contains duplicate variable %q" $.prefix .name) -}}
 {{- end -}}
 {{- $names = append $names .name -}}
 {{- end -}}
-{{- range $key, $value := .Values.extraEnv -}}
+{{- range $key, $value := .extraEnv -}}
 {{- if not (has $key $names) -}}
 {{- $overrides = append $overrides (dict "name" $key "value" (toString $value)) -}}
 {{- $names = append $names $key -}}
 {{- end -}}
 {{- end -}}
 {{- $env := list -}}
-{{- range include "stalwart.generatedEnv" . | fromYamlArray -}}
+{{- range .generated | fromYamlArray -}}
 {{- if not (has .name $names) -}}{{- $env = append $env . -}}{{- end -}}
 {{- end -}}
 {{- concat $env $overrides | toYaml -}}

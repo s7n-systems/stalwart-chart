@@ -21,6 +21,11 @@ run that died after creating one, are revoked. A lock annotation on the Secret, 
 optimistic concurrency, serializes runs of different Jobs. Applications that read the Secret
 pick up a new password when they restart.
 
+Blob encryption key: Stalwart (1.0.3 to 1.1.0) does not resolve plan references in Email and
+FileStorage.blobEncryptionKey, so the provisioning Job only creates the SymmetricKey, and this
+Job points both settings at it by its id (encryption.blobKey.email / fileStorage), or clears a
+setting that points at it when disabled. A change restarts Stalwart, which loads keys at startup.
+
 Errors fail the run, which the Job retries; every step can resume. Standard library only.
 Configuration: the JSON file in $CONFIG_FILE; the Stalwart administrator in $STALWART_USER /
 $STALWART_PASSWORD; the Kubernetes API through the projected service account token.
@@ -215,22 +220,54 @@ def smtp_check(check, address, password, attempts=3, wait=3):
 
 # --- Restart ------------------------------------------------------------------------------
 
-def restart(config, kube, stalwart):
-    """Rolls the StatefulSet when the pods may not run the current settings plan, waits until
-    it is ready, then records the plan in Stalwart's database."""
+def blob_key(config, stalwart):
+    """Points Email and FileStorage at the chart's SymmetricKey. Returns True when it changed
+    a setting."""
+    wanted = config.get("blobKey")
+    if not wanted:
+        return False
+    keys = stalwart.call("x:SymmetricKey/get", {}).get("list", [])
+    key_id = next((k["id"] for k in keys if k.get("description") == wanted["description"]), None)
+    if key_id is None:
+        raise Failure(f"SymmetricKey \"{wanted['description']}\" not found; the provisioning Job creates it")
+    changed = False
+    for obj, enabled in (("Email", wanted["email"]), ("FileStorage", wanted["fileStorage"])):
+        found = stalwart.call(f"x:{obj}/get", {"ids": ["singleton"], "properties": ["blobEncryptionKey"]}).get("list", [])
+        current = found[0].get("blobEncryptionKey") if found else None
+        # Disabled: clear only our own key, never one configured outside the chart.
+        target = key_id if enabled else (None if current == key_id else current)
+        if current == target:
+            continue
+        result = stalwart.call(f"x:{obj}/set", {"update": {"singleton": {"blobEncryptionKey": target}}})
+        if "singleton" not in result.get("updated", {}):
+            error = result.get("notUpdated", {}).get("singleton", {})
+            raise Failure(f"{obj}.blobEncryptionKey: {error.get('type')} {error.get('description', '')}")
+        log("blob-key", f"{obj}: " + (f"new blobs encrypted with key {key_id}" if target else "new blobs no longer encrypted"))
+        changed = True
+    return changed
+
+
+def restart(config, kube, stalwart, force=False):
+    """Rolls the StatefulSet when the pods may not run the current settings plan, or when force
+    is set, waits until it is ready, then records the plan in Stalwart's database."""
     r, wanted = config["restart"], config["restart"]["settingsHash"]
     statefulset = kube.get_statefulset(r["namespace"], r["statefulset"])
     applied = statefulset["spec"]["template"]["metadata"].get("annotations", {}).get(SETTINGS, "")
     role_id, state, stamp = stalwart.settings_marker(config["release"])
     marked = (stamp or "").split("@")[0] == wanted
-    if state == "done" and marked and applied.split("@")[0] == wanted:
+    if state == "done" and marked and applied.split("@")[0] == wanted and not force:
         log("restart", "settings unchanged, no restart")
         return
     if state == "pending" and marked:
         # An earlier run patched (or was about to patch) this stamp: resume, do not roll again.
         log("restart", f"resuming the rollout {stamp} of an earlier run")
     else:
-        reason = "settings changed" if applied.split("@")[0] != wanted else "settings not yet loaded from Stalwart's database (reset?)"
+        if force:
+            reason = "blob encryption key setting changed"
+        elif applied.split("@")[0] != wanted:
+            reason = "settings changed"
+        else:
+            reason = "settings not yet loaded from Stalwart's database (reset?)"
         log("restart", f"{reason}; restarting StatefulSet {r['statefulset']}")
         # The time makes the pod template change even when only the marker was missing.
         stamp = f"{wanted}@{int(time.time())}"
@@ -352,8 +389,9 @@ def main():
     kube = Kubernetes()
     stalwart = Stalwart(config["stalwartUrl"], os.environ["STALWART_USER"], os.environ["STALWART_PASSWORD"])
     try:
+        force = blob_key(config, stalwart)
         if config.get("restart"):
-            restart(config, kube, stalwart)
+            restart(config, kube, stalwart, force)
     except Failure as e:
         log("restart", f"FAILED: {e}")
         sys.exit(1)
