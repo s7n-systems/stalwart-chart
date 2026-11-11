@@ -1,4 +1,4 @@
-{{- if and .Values.webmail.enabled .Values.webmail.persistence.enabled }}
+{{- if and .Values.webmail.enabled .Values.webmail.persistence.enabled (not .Values.webmail.persistence.existingClaim) }}
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:

@@ -1,9 +1,12 @@
 ---
 extends: "default"
-# Helm templates are Go templates, not YAML; the vendored subchart is not ours.
+# Helm templates are Go templates, not YAML; the vendored subchart is not ours;
+# rendered/ and rendered-check/ are gitignored output of the local scripts.
 ignore: |
   templates/
   charts/
+  rendered/
+  rendered-check/
 rules:
   # Long CEL expressions in the Kyverno policies and generated comments are fine.
   line-length: "disable"

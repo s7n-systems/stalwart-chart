@@ -691,6 +691,39 @@ class ChartChecks(unittest.TestCase):
         # The pre-1.0.2 settings are rejected rather than silently ignored.
         render({'email': {'provision': True, 'encryptAtRest': True}}, succeeds=False)
 
+    def test_blob_encryption_and_compression(self):
+        def reconcile_config(docs):
+            return json.loads(next(d for d in docs if d['kind'] == 'ConfigMap' and d['metadata']['name'] == 'stalwart-reconcile')['data']['config.json'])
+        def env(docs):
+            return {e['name']: e for e in workload(docs)['spec']['template']['spec']['containers'][0]['env'] or []}
+
+        docs = render({'provisioning': {'existingSecret': 'admin'}, 'hostname': 'mail.example.org', 'domain': 'example.org'})
+        self.assertFalse(any(line['object'] in ('SymmetricKey', 'Email', 'FileStorage') for line in plan_lines(docs)))
+        self.assertNotIn('STALWART_BLOB_KEY', env(docs))
+        self.assertIsNone(reconcile_config(docs)['blobKey'])
+
+        # The key: its secret reaches Stalwart through the environment, never the plan. The
+        # reconcile Job sets blobEncryptionKey, which Stalwart (1.0.3 to 1.1.0) cannot take as a reference.
+        docs = render({'provisioning': {'existingSecret': 'admin'},
+                       'encryption': {'blobKey': {'existingSecret': 'blob', 'cipher': 'chacha20Poly1305', 'fileStorage': False}}})
+        lines = plan_lines(docs)
+        self.assertEqual([line for line in lines if line['object'] == 'SymmetricKey'], [{
+            '@type': 'upsert', 'object': 'SymmetricKey', 'matchOn': ['description'],
+            'value': {'blob-key': {'description': 'Helm chart blob key', 'cipher': 'chacha20Poly1305',
+                                   'key': {'@type': 'EnvironmentVariable', 'variableName': 'STALWART_BLOB_KEY'}}}}])
+        self.assertFalse(any(line['object'] in ('Email', 'FileStorage') for line in lines))
+        self.assertEqual(env(docs)['STALWART_BLOB_KEY']['valueFrom'], {'secretKeyRef': {'name': 'blob', 'key': 'key'}})
+        self.assertEqual(reconcile_config(docs)['blobKey'], {'description': 'Helm chart blob key', 'email': True, 'fileStorage': False})
+        render({'encryption': {'blobKey': {'existingSecret': 'blob'}}}, succeeds=False)
+        render({'provisioning': {'existingSecret': 'admin'}, 'encryption': {'blobKey': {'existingSecret': 'blob', 'cipher': 'aes128'}}}, succeeds=False)
+
+        # Compression alone, applied to both blob kinds.
+        docs = render({'provisioning': {'existingSecret': 'admin'}, 'blobStore': {'backend': 'existing', 'compression': 'zstd'}})
+        self.assertEqual([line for line in plan_lines(docs) if line['object'] in ('Email', 'FileStorage')], [
+            {'@type': 'update', 'object': 'Email', 'value': {'compressionAlgorithm': 'zstd'}},
+            {'@type': 'update', 'object': 'FileStorage', 'value': {'compressionAlgorithm': 'zstd'}}])
+        render({'provisioning': {'existingSecret': 'admin'}, 'blobStore': {'backend': 'existing', 'compression': 'brotli'}}, succeeds=False)
+
     def test_oidc_directory_provisioning(self):
         # Disabled by default: no Directory/Authentication lines even
         # when something else already triggers the provisioning Job.
@@ -1174,6 +1207,96 @@ class ChartChecks(unittest.TestCase):
         self.assertEqual((pod['hostAliases'], pod['initContainers']), (aliases, init))
         # Unknown top-level keys, e.g. typos, are rejected.
         render({'nodeSelecter': {'zone': 'a'}}, succeeds=False)
+
+    def test_webmail_user_and_init_containers(self):
+        docs = render({'webmail': {'enabled': True}})
+        pod = next(d for d in docs if d['kind'] == 'Deployment')['spec']['template']['spec']
+        self.assertNotIn('initContainers', pod)
+        # The published image's user is nextjs (UID 1001).
+        self.assertEqual((pod['securityContext']['runAsUser'], pod['securityContext']['runAsGroup'], pod['securityContext']['fsGroup']), (1001, 1001, 1001))
+        init = [{'name': 'seed', 'image': 'busybox'}]
+        docs = render({'webmail': {'enabled': True, 'extraInitContainers': init}})
+        pod = next(d for d in docs if d['kind'] == 'Deployment')['spec']['template']['spec']
+        self.assertEqual(pod['initContainers'], init)
+
+    def test_webmail_existing_claim(self):
+        docs = render({'webmail': {'enabled': True, 'persistence': {'enabled': True, 'existingClaim': 'restored-webmail'}}})
+        self.assertFalse([d for d in docs if d['kind'] == 'PersistentVolumeClaim'])
+        dep = next(d for d in docs if d['kind'] == 'Deployment')
+        data = next(v for v in dep['spec']['template']['spec']['volumes'] if v['name'] == 'data')
+        self.assertEqual(data, {'name': 'data', 'persistentVolumeClaim': {'claimName': 'restored-webmail'}})
+        self.assertEqual(dep['spec']['strategy'], {'type': 'Recreate'})
+        # Without persistence the claim is ignored.
+        docs = render({'webmail': {'enabled': True, 'persistence': {'existingClaim': 'restored-webmail'}}})
+        dep = next(d for d in docs if d['kind'] == 'Deployment')
+        self.assertIn('emptyDir', next(v for v in dep['spec']['template']['spec']['volumes'] if v['name'] == 'data'))
+
+    def test_webmail_logging_proxy_and_logout(self):
+        def env(webmail):
+            docs = render({'webmail': {'enabled': True, **webmail}})
+            entries = next(d for d in docs if d['kind'] == 'Deployment')['spec']['template']['spec']['containers'][0]['env']
+            names = [e['name'] for e in entries]
+            self.assertEqual(len(names), len(set(names)))
+            return {e['name']: e.get('value') for e in entries}
+        values = env({})
+        self.assertEqual((values['TRUSTED_PROXY_DEPTH'], values['LOG_FORMAT'], values['LOG_LEVEL']), ('1', 'text', 'info'))
+        self.assertNotIn('OAUTH_END_SESSION', values)
+        values = env({'trustedProxyDepth': 2, 'logFormat': 'json', 'oauth': {'enabled': True, 'clientId': 'bulwark', 'issuerUrl': 'https://id.example.org'}})
+        self.assertEqual((values['TRUSTED_PROXY_DEPTH'], values['LOG_FORMAT'], values['OAUTH_END_SESSION']), ('2', 'json', 'true'))
+        self.assertNotIn('OAUTH_END_SESSION_URL', values)
+        self.assertNotIn('OAUTH_POST_LOGOUT_REDIRECT_URI', values)
+        values = env({'oauth': {'enabled': True, 'clientId': 'bulwark', 'issuerUrl': 'https://id.example.org', 'endSession': False,
+                                'endSessionUrl': 'https://id.example.org/logout', 'postLogoutRedirectUri': 'https://webmail.example.org/en/login'}})
+        self.assertEqual((values['OAUTH_END_SESSION'], values['OAUTH_END_SESSION_URL'], values['OAUTH_POST_LOGOUT_REDIRECT_URI']),
+                         ('false', 'https://id.example.org/logout', 'https://webmail.example.org/en/login'))
+        self.assertNotIn('OAUTH_PASSWORD_FALLBACK_ENABLED', values)
+        values = env({'oauth': {'enabled': True, 'clientId': 'bulwark', 'issuerUrl': 'https://id.example.org', 'only': True, 'passwordFallback': True}})
+        self.assertEqual(values['OAUTH_PASSWORD_FALLBACK_ENABLED'], 'true')
+        render({'webmail': {'enabled': True, 'oauth': {'enabled': True, 'clientId': 'bulwark', 'issuerUrl': 'https://id.example.org', 'passwordFallback': True}}}, succeeds=False)
+        # extraEnv and extraEnvVars replace generated variables instead of duplicating them.
+        values = env({'extraEnv': {'LOG_LEVEL': 'debug'}, 'extraEnvVars': [{'name': 'LOG_FORMAT', 'value': 'json'}]})
+        self.assertEqual((values['LOG_LEVEL'], values['LOG_FORMAT']), ('debug', 'json'))
+        for invalid in ({'logFormat': 'xml'}, {'logLevel': 'trace'}, {'trustedProxyDepth': 0},
+                        {'oauth': {'endSessionUrl': 'http://id.example.org/logout'}},
+                        {'extraEnvVars': [{'name': 'DUP', 'value': '1'}, {'name': 'DUP', 'value': '2'}]}):
+            render({'webmail': {'enabled': True, **invalid}}, succeeds=False)
+
+    def test_network_policies(self):
+        self.assertFalse([d for d in render({'webmail': {'enabled': True}}) if d['kind'] == 'NetworkPolicy'])
+        ingress_nginx = {'namespaceSelector': {'matchLabels': {'kubernetes.io/metadata.name': 'ingress-nginx'}}}
+        relay = {'ipBlock': {'cidr': '192.0.2.0/24'}}
+        extra = {'ports': [{'port': 9999}], 'from': [relay]}
+        docs = render({'networkPolicy': {'enabled': True, 'management': {'from': [ingress_nginx]}, 'webmail': {'from': [ingress_nginx]},
+                                         'extraIngress': [extra]},
+                       'webmail': {'enabled': True}})
+        policies = {d['metadata']['name']: d['spec'] for d in docs if d['kind'] == 'NetworkPolicy'}
+        server, webmail = policies['stalwart'], policies['stalwart-webmail']
+        self.assertEqual(server['podSelector']['matchLabels']['app.kubernetes.io/component'], 'server')
+        self.assertEqual(server['policyTypes'], ['Ingress'])
+        mail, management, appended = server['ingress']
+        # Mail ports are open to any source by default.
+        self.assertEqual(sorted(p['port'] for p in mail['ports']), ['https', 'imaps', 'smtp', 'smtps'])
+        self.assertNotIn('from', mail)
+        self.assertEqual(management['ports'], [{'port': 'mgmt', 'protocol': 'TCP'}])
+        self.assertEqual(management['from'], [{'podSelector': {'matchLabels': {'app.kubernetes.io/instance': 'stalwart'}}}, ingress_nginx])
+        self.assertEqual(appended, extra)
+        self.assertEqual(webmail['podSelector']['matchLabels']['app.kubernetes.io/component'], 'webmail')
+        self.assertEqual(webmail['ingress'], [{'ports': [{'port': 'http', 'protocol': 'TCP'}], 'from': [ingress_nginx]}])
+        # Release pods (webmail, provisioning and reconcile Jobs) match the management rule.
+        for doc in docs:
+            if doc['kind'] in ('Deployment', 'StatefulSet', 'Job'):
+                self.assertEqual(doc['spec']['template']['metadata']['labels']['app.kubernetes.io/instance'], 'stalwart')
+        docs = render({'networkPolicy': {'enabled': True, 'mail': {'from': [relay]}}, 'service': {'ports': {'https': None, 'imaps': None, 'smtps': None}}})
+        server = next(d for d in docs if d['kind'] == 'NetworkPolicy')['spec']
+        self.assertEqual(server['ingress'][0], {'ports': [{'port': 'smtp', 'protocol': 'TCP'}], 'from': [relay]})
+        self.assertEqual(server['ingress'][1]['from'], [{'podSelector': {'matchLabels': {'app.kubernetes.io/instance': 'stalwart'}}}])
+        # An Ingress or HTTPRoute on the management backend needs its controller allowed.
+        domain = {'domain': 'example.org'}
+        error = render({**domain, 'networkPolicy': {'enabled': True}, 'ingress': {'enabled': True}}, succeeds=False)
+        self.assertIn('networkPolicy.management.from', error)
+        render({**domain, 'networkPolicy': {'enabled': True}, 'gatewayAPI': {'httpRoute': {'enabled': True, 'parentRefs': [{'name': 'gw'}]}}}, succeeds=False)
+        render({**domain, 'networkPolicy': {'enabled': True, 'management': {'from': [ingress_nginx]}}, 'ingress': {'enabled': True}})
+        render({**domain, 'networkPolicy': {'enabled': True}, 'ingress': {'enabled': True, 'backend': 'mail'}})
 
 if __name__ == '__main__':
     unittest.main()

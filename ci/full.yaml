@@ -8,6 +8,7 @@ dataStore:
     existingSecret: "stalwart-postgresql"
 blobStore:
   backend: "s3"
+  compression: "zstd"
   s3:
     bucket: "mail"
     existingSecret: "stalwart-s3"
@@ -23,6 +24,24 @@ ingress:
     - secretName: "mail-tls"
       hosts: ["mail.example.org"]
 podAntiAffinityPreset: "soft"
+networkPolicy:
+  enabled: true
+  management:
+    from:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: "ingress-nginx"
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: "monitoring"
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/name: "prometheus"
+  webmail:
+    from:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: "ingress-nginx"
 autoscaling:
   enabled: true
   maxReplicas: 3
@@ -35,6 +54,8 @@ metrics:
     enabled: true
 encryption:
   provision: true
+  blobKey:
+    existingSecret: "stalwart-blob-key"
 oidc:
   enabled: true
   activate: false
@@ -51,6 +72,11 @@ coordinator:
 webmail:
   enabled: true
   jmapServerUrl: "https://mail.example.org"
+  logFormat: "json"
+  oauth:
+    enabled: true
+    clientId: "bulwark"
+    postLogoutRedirectUri: "https://webmail.example.org/en/login"
   sessionSecret:
     existingSecret: "bulwark-session"
   adminPassword:

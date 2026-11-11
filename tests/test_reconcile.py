@@ -180,6 +180,52 @@ class ReconcileChecks(unittest.TestCase):
             ss['status'][key] = value
             self.assertFalse(r.rolled_out(ss), key)
 
+    def test_forced_restart_rolls_unchanged_settings(self):
+        self.stalwart.settings_marker.return_value = ('role', 'done', 'hash@1')
+        with patch.object(r.time, 'time', return_value=100):
+            r.restart(self.config, self.kube, self.stalwart, force=True)
+        self.kube.patch_statefulset.assert_called_once()
+        self.assertEqual([c.args[2:] for c in self.stalwart.set_settings_marker.call_args_list], [('pending', 'hash@100'), ('done', 'hash@100')])
+
+    def blob_stalwart(self, email, files, keys=None):
+        settings = {'Email': email, 'FileStorage': files}
+        calls = []
+        def call(method, args):
+            calls.append((method, args))
+            obj, verb = method[2:].split('/')
+            if obj == 'SymmetricKey':
+                return {'list': [{'id': 'x', 'description': 'other'}, {'id': 'k', 'description': 'Helm chart blob key'}] if keys is None else keys}
+            if verb == 'get':
+                return {'list': [{'id': 'singleton', 'blobEncryptionKey': settings[obj]}]}
+            settings[obj] = args['update']['singleton']['blobEncryptionKey']
+            return {'updated': {'singleton': None}}
+        stalwart = Mock()
+        stalwart.call.side_effect = call
+        return stalwart, settings, calls
+
+    def test_blob_key_points_settings_at_the_chart_key(self):
+        self.config['blobKey'] = {'description': 'Helm chart blob key', 'email': True, 'fileStorage': False}
+        stalwart, settings, calls = self.blob_stalwart(None, None)
+        self.assertTrue(r.blob_key(self.config, stalwart))
+        self.assertEqual(settings, {'Email': 'k', 'FileStorage': None})
+        # Unchanged on the next run: no update, no forced restart.
+        self.assertFalse(r.blob_key(self.config, stalwart))
+        self.assertEqual(sum(1 for m, _ in calls if m.endswith('/set')), 1)
+
+    def test_blob_key_disabled_clears_only_the_chart_key(self):
+        self.config['blobKey'] = {'description': 'Helm chart blob key', 'email': False, 'fileStorage': False}
+        stalwart, settings, _ = self.blob_stalwart('k', 'x')
+        self.assertTrue(r.blob_key(self.config, stalwart))
+        self.assertEqual(settings, {'Email': None, 'FileStorage': 'x'})
+
+    def test_blob_key_missing_or_unconfigured(self):
+        stalwart, _, calls = self.blob_stalwart(None, None, keys=[])
+        self.assertFalse(r.blob_key(self.config, stalwart))
+        self.assertEqual(calls, [])
+        self.config['blobKey'] = {'description': 'Helm chart blob key', 'email': True, 'fileStorage': True}
+        with self.assertRaises(r.Failure):
+            r.blob_key(self.config, stalwart)
+
     def test_ipv6_api_url(self):
         with patch.dict(os.environ, {'KUBERNETES_SERVICE_HOST': 'fd00::1', 'KUBERNETES_SERVICE_PORT': '443', 'KUBERNETES_API': ''}), patch.object(r.ssl, 'create_default_context'):
             self.assertEqual(r.Kubernetes().base, 'https://[fd00::1]:443')

@@ -38,11 +38,11 @@ image:
   repository: "stalwartlabs/stalwart"
   # -- Image tag, kept in sync with the digest by Renovate.
   # @default -- pinned, see values.yaml
-  tag: "v1.0.2"
+  tag: "v1.1.0"
   # -- Multi-arch index digest of the tag. Takes precedence over the tag;
   # clear it to float on the tag instead.
   # @default -- pinned, see values.yaml
-  digest: "sha256:154e55adecadfcc4a67044b9b94d482a20286e1101c97a2b322224bb596053d5"
+  digest: "sha256:f772aa6ef8cd8018969fa491640f1436b0270eb14e2c219b5f37f1a77020837e"
   # -- A digest never changes, so a cached image is always the right one.
   pullPolicy: "IfNotPresent"
   pullSecrets: []
@@ -167,6 +167,10 @@ blobStore:
     keyPrefix: ""
     verifyAfterWrite: true
     allowInvalidCerts: false
+  # -- Compression of new mail and file storage (WebDAV) blobs: lz4 (Stalwart's
+  # default), zstd or none. Empty leaves the setting unchanged. Existing blobs keep
+  # their compression until a BlobRecode task rewrites them. Requires provisioning credentials.
+  compression: ""
 
 # Selecting S3 runs a post-install/post-upgrade CLI Job against management.
 provisioning:
@@ -211,7 +215,7 @@ provisioning:
       # -- Multi-arch index digest of the tag. Takes precedence over the tag;
       # clear it to float on the tag instead.
       # @default -- pinned, see values.yaml
-      digest: "sha256:20a82dbc2783112ddb91d1534603f802d222a3e63e593cd002eb2ac534e70211"
+      digest: "sha256:a0f2e268f2ce8f3709611a90054ec6a8ae31f6251f5896b8648b9bb99835e30a"
       pullPolicy: "IfNotPresent"
       pullSecrets: []
     # -- How long to wait for the restarted pods to become ready.
@@ -412,6 +416,30 @@ gatewayAPI:
   #     annotations: {}
   tcpRoutes: {}
 
+# Ingress NetworkPolicies for the Stalwart and webmail pods. Egress stays open: Stalwart
+# delivers mail to the internet and queries DNS, DNSBLs, ACME and its stores; Bulwark
+# reaches its JMAP server, identity provider and plugins. Kubelet probes are not affected.
+networkPolicy:
+  enabled: false
+  mail:
+    # -- NetworkPolicyPeers allowed to reach Stalwart's service.ports (mail and HTTPS).
+    # Empty allows any source, since mail clients and other mail servers connect from
+    # anywhere. E.g. an ipBlock for a submission-only relay network.
+    from: []
+  management:
+    # -- NetworkPolicyPeers allowed to reach the management port (JMAP, admin API,
+    # metrics), in addition to this release's own pods (webmail, provisioning and
+    # reconcile Jobs). Add the ingress controller or Gateway when ingress or the
+    # HTTPRoute uses the management backend, Prometheus for metrics, and other
+    # in-cluster clients such as a provisioning connector.
+    from: []
+  webmail:
+    # -- NetworkPolicyPeers allowed to reach the webmail port. Empty allows any source;
+    # normally the ingress controller's or Gateway's namespace.
+    from: []
+  # -- Extra ingress rules appended to the Stalwart policy as written.
+  extraIngress: []
+
 # Persistent volume for the data directory. Required when the
 # DataStore is a local backend such as RocksDB. Can be disabled
 # for deployments that use an external store (PostgreSQL, MySQL,
@@ -514,6 +542,24 @@ encryption:
   atRestEnable: true
   # -- Reapplies atRestEnable on every install/upgrade. Requires provisioning credentials.
   provision: false
+  # Server-side blob encryption (Stalwart 1.0.3): Stalwart encrypts the message and file
+  # blobs it writes with a symmetric key, so the blob store (e.g. the S3 provider) only holds
+  # ciphertext. Unlike encryption at rest above, Stalwart can still read, index and search the
+  # messages. Existing blobs stay unencrypted until a BlobRecode task rewrites them (see the
+  # README). Setting existingSecret creates the key and requires provisioning credentials.
+  blobKey:
+    # -- Secret holding the key: 32 random bytes, base64-encoded (openssl rand -base64 32).
+    # Keep a copy: blobs written with the key cannot be read without it.
+    existingSecret: ""
+    # -- Key in existingSecret that holds the key.
+    secretKey: "key"
+    # -- aes256Gcm or chacha20Poly1305. Do not change it, or the key in the Secret, once
+    # the key exists: Stalwart then refuses to load it and cannot store new mail.
+    cipher: "aes256Gcm"
+    # -- Encrypts new mail blobs with the key. false stops encrypting new mail blobs.
+    email: true
+    # -- Encrypts new file storage (WebDAV) blobs with the key. false stops encrypting them.
+    fileStorage: true
 
 # Delegates authentication to a third-party OpenID Connect provider
 # (e.g. Keycloak). This is a resource-server integration: Stalwart
@@ -618,11 +664,11 @@ webmail:
     repository: "bulwarkmail/webmail"
     # -- Image tag, kept in sync with the digest by Renovate.
     # @default -- pinned, see values.yaml
-    tag: "1.20.0"
+    tag: "1.21.1"
     # -- Multi-arch index digest of the tag. Takes precedence over the tag;
     # clear it to float on the tag instead.
     # @default -- pinned, see values.yaml
-    digest: "sha256:df2074bd1f714f89643da127acf547d4167b4960a22cc1a3fa1570b4584ad16f"
+    digest: "sha256:53df0683b2c59870611073b425937999c859b3a51106ecda08ed41ee12d97a7d"
     pullPolicy: "IfNotPresent"
     pullSecrets: []
 
@@ -669,6 +715,14 @@ webmail:
   # management, vacation responder, account security, API keys, admin
   # dashboard). Matches Bulwark's own default.
   stalwartFeatures: true
+  # -- Reverse proxies in front of the pods that append X-Forwarded-For: 1 for an
+  # ingress controller or Gateway alone, 2 with a cloud load balancer in front of
+  # it. Sign-in limits and the audit log use the client address this selects.
+  trustedProxyDepth: 1
+  # -- `text` or `json` (for log aggregation).
+  logFormat: "text"
+  # -- `error`, `warn`, `info` or `debug`.
+  logLevel: "info"
 
   # Encrypts sessions, synced settings, multi-account and OAuth PKCE state.
   # Bulwark generates one if unset; pin it explicitly for multiple replicas.
@@ -726,6 +780,9 @@ webmail:
     # -- Starts the OAuth redirect automatically with no user interaction.
     # Requires only: true.
     autoSso: false
+    # -- Keeps a "Sign in with a password" link next to single sign-on, so SSO and
+    # password accounts work side by side. Requires only: true.
+    passwordFallback: false
     clientId: ""
     # -- Client secret for a confidential client. Leave existingSecret and
     # clientSecret empty for a public client, which uses PKCE only.
@@ -735,6 +792,16 @@ webmail:
     clientSecret: ""
     scopes: ""
     extraScopes: ""
+    # -- Signing out also signs out of the identity provider (RP-initiated
+    # logout). Set false when the provider's session is shared with other apps
+    # that should stay signed in.
+    endSession: true
+    # -- Logout URL (https) for providers whose discovery document has no
+    # end_session_endpoint, such as Stalwart's built-in provider.
+    endSessionUrl: ""
+    # -- Where the provider sends the browser after logout, e.g.
+    # https://webmail.example.org/en/login. Register it at the provider first.
+    postLogoutRedirectUri: ""
 
   # Disable Bulwark telemetry. This does not disable other outbound traffic.
   telemetry:
@@ -779,6 +846,10 @@ webmail:
   # across pod replacements. Multiple replicas use sharedStore instead.
   persistence:
     enabled: false
+    # -- Mount this PersistentVolumeClaim instead of creating one, e.g. a restored
+    # snapshot or a statically provisioned volume. size, storageClass and annotations
+    # then do not apply; set accessMode to the claim's mode.
+    existingClaim: ""
     accessMode: "ReadWriteOnce"
     storageClass: ""
     # -- Local state capacity. Preserve the current PVC size on upgrades;
@@ -799,12 +870,12 @@ webmail:
 
   podSecurityContext:
     enabled: true
-    # -- The published image's non-root user; adjust if a custom image
-    # uses a different UID/GID.
-    fsGroup: 1000
+    # -- The published image's non-root user (nextjs, UID 1001); adjust if a
+    # custom image uses a different UID/GID.
+    fsGroup: 1001
     fsGroupChangePolicy: "OnRootMismatch"
-    runAsUser: 1000
-    runAsGroup: 1000
+    runAsUser: 1001
+    runAsGroup: 1001
     runAsNonRoot: true
     seccompProfile:
       type: "RuntimeDefault"
@@ -858,12 +929,14 @@ webmail:
   podAntiAffinityPreset: ""
   tolerations: []
   # -- Extra environment variables for anything not exposed as its own
-  # value above (branding, PWA icons, cookie/CSP settings, logging,
-  # locale, etc.) -- see bulwarkmail.org's environment reference.
+  # value above (branding, PWA icons, cookie/CSP settings, locale, etc.)
+  # -- see bulwarkmail.org's environment reference.
   extraEnv: {}
   extraEnvVars: []
   extraVolumes: []
   extraVolumeMounts: []
+  # -- Extra init containers for the webmail pod, e.g. to seed /app/data.
+  extraInitContainers: []
 
 # Startup probe on `/healthz/live` of the management port. Allows up to ten minutes of startup before liveness checks begin.
 startupProbe:

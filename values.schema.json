@@ -638,6 +638,57 @@
         }
       }
     },
+    "networkPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "mail": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "from": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "management": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "from": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "webmail": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "from": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "extraIngress": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        }
+      }
+    },
     "dataStore": {
       "type": "object",
       "additionalProperties": false,
@@ -763,6 +814,14 @@
               "type": "boolean"
             }
           }
+        },
+        "compression": {
+          "enum": [
+            "",
+            "lz4",
+            "zstd",
+            "none"
+          ]
         }
       }
     },
@@ -1120,6 +1179,31 @@
         },
         "provision": {
           "type": "boolean"
+        },
+        "blobKey": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "existingSecret": {
+              "type": "string"
+            },
+            "secretKey": {
+              "type": "string",
+              "minLength": 1
+            },
+            "cipher": {
+              "enum": [
+                "aes256Gcm",
+                "chacha20Poly1305"
+              ]
+            },
+            "email": {
+              "type": "boolean"
+            },
+            "fileStorage": {
+              "type": "boolean"
+            }
+          }
         }
       }
     },
@@ -1290,6 +1374,26 @@
         "stalwartFeatures": {
           "type": "boolean"
         },
+        "trustedProxyDepth": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "logFormat": {
+          "type": "string",
+          "enum": [
+            "text",
+            "json"
+          ]
+        },
+        "logLevel": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warn",
+            "info",
+            "debug"
+          ]
+        },
         "sessionSecret": {
           "type": "object",
           "additionalProperties": false,
@@ -1367,6 +1471,9 @@
             "autoSso": {
               "type": "boolean"
             },
+            "passwordFallback": {
+              "type": "boolean"
+            },
             "clientId": {
               "type": "string"
             },
@@ -1384,6 +1491,16 @@
               "type": "string"
             },
             "extraScopes": {
+              "type": "string"
+            },
+            "endSession": {
+              "type": "boolean"
+            },
+            "endSessionUrl": {
+              "type": "string",
+              "pattern": "^(https://.*)?$"
+            },
+            "postLogoutRedirectUri": {
               "type": "string"
             }
           }
@@ -1528,6 +1645,9 @@
             "enabled": {
               "type": "boolean"
             },
+            "existingClaim": {
+              "type": "string"
+            },
             "accessMode": {
               "type": "string",
               "minLength": 1
@@ -1639,6 +1759,9 @@
           "type": "array"
         },
         "extraVolumeMounts": {
+          "type": "array"
+        },
+        "extraInitContainers": {
           "type": "array"
         }
       }

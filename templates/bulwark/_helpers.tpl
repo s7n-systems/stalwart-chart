@@ -129,6 +129,9 @@ true
 {{- if and .Values.webmail.oauth.autoSso (not .Values.webmail.oauth.only) -}}
 {{- fail "webmail.oauth.autoSso requires webmail.oauth.only" -}}
 {{- end -}}
+{{- if and .Values.webmail.oauth.passwordFallback (not .Values.webmail.oauth.only) -}}
+{{- fail "webmail.oauth.passwordFallback requires webmail.oauth.only" -}}
+{{- end -}}
 {{- if and .Values.webmail.autoscaling.enabled (gt (int .Values.webmail.autoscaling.minReplicas) (int .Values.webmail.autoscaling.maxReplicas)) -}}
 {{- fail "webmail.autoscaling.minReplicas must not be greater than webmail.autoscaling.maxReplicas" -}}
 {{- end -}}
@@ -145,3 +148,122 @@ true
 {{- fail "webmail.autoscaling.targetMemoryUtilizationPercentage requires webmail.resources.requests.memory" -}}
 {{- end -}}
 {{- end -}}
+
+{{/* Environment generated from webmail values; merged with extraEnv/extraEnvVars by stalwart.mergeEnv. */}}
+{{- define "stalwart.webmailGeneratedEnv" }}
+- name: PORT
+  value: {{ .Values.webmail.service.port | quote }}
+- name: JMAP_SERVER_URL
+  value: {{ include "stalwart.webmailJmapUrl" . | quote }}
+{{- if .Values.webmail.appName }}
+- name: APP_NAME
+  value: {{ .Values.webmail.appName | quote }}
+{{- end }}
+- name: STALWART_FEATURES
+  value: {{ .Values.webmail.stalwartFeatures | quote }}
+- name: SETTINGS_SYNC_ENABLED
+  value: {{ .Values.webmail.settingsSync.enabled | quote }}
+- name: TRUSTED_PROXY_DEPTH
+  value: {{ .Values.webmail.trustedProxyDepth | quote }}
+- name: LOG_FORMAT
+  value: {{ .Values.webmail.logFormat | quote }}
+- name: LOG_LEVEL
+  value: {{ .Values.webmail.logLevel | quote }}
+{{- if .Values.webmail.adminConfigReadonly }}
+- name: ADMIN_CONFIG_READONLY
+  value: "true"
+{{- end }}
+{{- if not .Values.webmail.telemetry.enabled }}
+- name: BULWARK_TELEMETRY
+  value: "off"
+{{- end }}
+{{- if (or .Values.webmail.sharedStore.existingSecret .Values.webmail.sharedStore.url) }}
+- name: REDIS_URL
+  valueFrom:
+    secretKeyRef:
+      {{- if .Values.webmail.sharedStore.existingSecret }}
+      name: {{ .Values.webmail.sharedStore.existingSecret | quote }}
+      key: {{ .Values.webmail.sharedStore.secretKey | quote }}
+      {{- else }}
+      name: {{ include "stalwart.webmailFullname" . }}-env
+      key: redisUrl
+      {{- end }}
+{{- with .Values.webmail.sharedStore.keyPrefix }}
+- name: REDIS_KEY_PREFIX
+  value: {{ . | quote }}
+{{- end }}
+{{- end }}
+{{- if or .Values.webmail.sessionSecret.existingSecret .Values.webmail.sessionSecret.value }}
+- name: SESSION_SECRET
+  valueFrom:
+    secretKeyRef:
+      {{- if .Values.webmail.sessionSecret.existingSecret }}
+      name: {{ .Values.webmail.sessionSecret.existingSecret | quote }}
+      key: {{ .Values.webmail.sessionSecret.secretKey | quote }}
+      {{- else }}
+      name: {{ include "stalwart.webmailFullname" . }}-env
+      key: sessionSecret
+      {{- end }}
+{{- end }}
+{{- if or .Values.webmail.adminPassword.existingSecret .Values.webmail.adminPassword.value }}
+- name: ADMIN_PASSWORD
+  valueFrom:
+    secretKeyRef:
+      {{- if .Values.webmail.adminPassword.existingSecret }}
+      name: {{ .Values.webmail.adminPassword.existingSecret | quote }}
+      key: {{ .Values.webmail.adminPassword.secretKey | quote }}
+      {{- else }}
+      name: {{ include "stalwart.webmailFullname" . }}-env
+      key: adminPassword
+      {{- end }}
+{{- end }}
+{{- if .Values.webmail.oauth.enabled }}
+- name: OAUTH_ENABLED
+  value: "true"
+- name: OAUTH_ONLY
+  value: {{ .Values.webmail.oauth.only | quote }}
+- name: AUTO_SSO_ENABLED
+  value: {{ .Values.webmail.oauth.autoSso | quote }}
+{{- if .Values.webmail.oauth.passwordFallback }}
+- name: OAUTH_PASSWORD_FALLBACK_ENABLED
+  value: "true"
+{{- end }}
+- name: OAUTH_CLIENT_ID
+  value: {{ .Values.webmail.oauth.clientId | quote }}
+{{- if or .Values.webmail.oauth.existingSecret .Values.webmail.oauth.clientSecret }}
+- name: OAUTH_CLIENT_SECRET
+  valueFrom:
+    secretKeyRef:
+      {{- if .Values.webmail.oauth.existingSecret }}
+      name: {{ .Values.webmail.oauth.existingSecret | quote }}
+      key: {{ .Values.webmail.oauth.clientSecretKey | quote }}
+      {{- else }}
+      name: {{ include "stalwart.webmailFullname" . }}-env
+      key: oauthClientSecret
+      {{- end }}
+{{- end }}
+{{- $issuerUrl := .Values.webmail.oauth.issuerUrl | default (and .Values.oidc.enabled .Values.oidc.issuerUrl) }}
+{{- if $issuerUrl }}
+- name: OAUTH_ISSUER_URL
+  value: {{ $issuerUrl | quote }}
+{{- end }}
+{{- if .Values.webmail.oauth.scopes }}
+- name: OAUTH_SCOPES
+  value: {{ .Values.webmail.oauth.scopes | quote }}
+{{- end }}
+{{- if .Values.webmail.oauth.extraScopes }}
+- name: OAUTH_EXTRA_SCOPES
+  value: {{ .Values.webmail.oauth.extraScopes | quote }}
+{{- end }}
+- name: OAUTH_END_SESSION
+  value: {{ .Values.webmail.oauth.endSession | quote }}
+{{- with .Values.webmail.oauth.endSessionUrl }}
+- name: OAUTH_END_SESSION_URL
+  value: {{ . | quote }}
+{{- end }}
+{{- with .Values.webmail.oauth.postLogoutRedirectUri }}
+- name: OAUTH_POST_LOGOUT_REDIRECT_URI
+  value: {{ . | quote }}
+{{- end }}
+{{- end }}
+{{- end }}

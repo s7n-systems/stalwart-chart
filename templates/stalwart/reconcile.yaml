@@ -93,6 +93,7 @@ data:
       "stalwartUrl" (printf "http://%s-management:%v" $fullname .Values.management.servicePort)
       "lockTimeoutSeconds" (int .Values.provisioning.reconcile.activeDeadlineSeconds)
       "restart" (dict "namespace" .Release.Namespace "statefulset" $fullname "settingsHash" (include "stalwart.settingsPlan" . | sha256sum) "timeoutSeconds" (int .Values.provisioning.reconcile.restartTimeoutSeconds))
+      "blobKey" (ternary (dict "description" (include "stalwart.blobKeyDescription" .) "email" .Values.encryption.blobKey.email "fileStorage" .Values.encryption.blobKey.fileStorage) nil (not (empty .Values.encryption.blobKey.existingSecret)))
       "smtpCheck" (ternary (dict "host" $check.host "port" (int $check.port) "startTls" $check.startTls) nil $check.enabled)
       "accounts" $accounts
       | toPrettyJson | nindent 4 }}

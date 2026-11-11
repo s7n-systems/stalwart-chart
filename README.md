@@ -60,11 +60,11 @@ The chart deploys Stalwart 1.0 as a StatefulSet and configures it the way Stalwa
 | | |
 | --- | --- |
 | **Storage** | External PostgreSQL (default) or local RocksDB as the database; S3 or any S3-compatible service for mail blobs |
-| **Declarative settings** | Blob store, server hostname and default domain, Prometheus exporter, logging, OIDC directory, in-memory store, cluster coordinator and encryption at rest applied by a CLI Job; anything else through `provisioning.extraPlan` |
+| **Declarative settings** | Blob store, server hostname and default domain, Prometheus exporter, logging, OIDC directory, in-memory store, cluster coordinator, encryption at rest, blob encryption and compression applied by a CLI Job; anything else through `provisioning.extraPlan` |
 | **System accounts** | Send-only accounts for other applications, with app passwords published to Secrets |
 | **Exposure** | Mail Service for SMTP, IMAP, POP3 and ManageSieve (LoadBalancer or NodePort); Ingress or Gateway API HTTPRoute for the web UI, JMAP and DAV; Gateway API TCPRoutes for mail ports; dual-stack |
 | **Scaling** | HorizontalPodAutoscaler with a conservative scale-down, PodDisruptionBudget, anti-affinity presets, topology spread, NATS/Redis/Kafka/Zenoh coordination |
-| **Security** | Non-root, read-only root filesystem, all capabilities dropped except `NET_BIND_SERVICE`, no ServiceAccount token in the Stalwart and webmail pods, images pinned by digest, optional Kyverno policies |
+| **Security** | Non-root, read-only root filesystem, all capabilities dropped except `NET_BIND_SERVICE`, no ServiceAccount token in the Stalwart and webmail pods, images pinned by digest, optional NetworkPolicies and Kyverno policies |
 | **Observability** | Prometheus exporter with optional Basic authentication and ServiceMonitor; logs to stdout |
 | **Certificates** | Mounted certificates (for example from cert-manager) reloaded on a schedule without restarting pods |
 | **Webmail** | Bulwark JMAP webmail with OAuth/OIDC login, its own autoscaling, PDB and persistence |
@@ -102,7 +102,7 @@ Copy the example to `my-values.yaml`, set the database host, bucket, `hostname` 
 
 ```sh
 helm upgrade --install stalwart oci://ghcr.io/s7n-systems/charts/stalwart \
-  --version 0.3.0 --namespace stalwart -f my-values.yaml --timeout 15m
+  --version 0.4.0 --namespace stalwart -f my-values.yaml --timeout 15m
 ```
 
 The chart validates required storage settings and credential references before rendering. It cannot check whether referenced Secrets exist or whether external services are reachable; these failures can still leave an incomplete installation. To install from a checkout instead, use `.` as the chart: Bitnami Common is vendored in `charts/`, so no dependency download is needed.
@@ -112,7 +112,7 @@ The chart validates required storage settings and credential references before r
 Release builds are signed keylessly with cosign 3 from this repository's release workflow. Cosign 3 stores the signature as an OCI referrer in the new bundle format; verify with cosign 3 or newer (cosign 2 reports "no signatures found"):
 
 ```sh
-cosign verify ghcr.io/s7n-systems/charts/stalwart:0.3.0 \
+cosign verify ghcr.io/s7n-systems/charts/stalwart:0.4.0 \
   --certificate-identity-regexp '^https://github\.com/s7n-systems/stalwart-chart/\.github/workflows/release\.yml@' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
@@ -122,7 +122,7 @@ cosign verify ghcr.io/s7n-systems/charts/stalwart:0.3.0 \
 For an interactive first-time setup, use recovery mode, which suspends mail services and opens only the management listener. You can instead provision domains and other settings through `provisioning.extraPlan` during a normal installation.
 
 ```sh
-helm upgrade --install stalwart oci://ghcr.io/s7n-systems/charts/stalwart --version 0.3.0 \
+helm upgrade --install stalwart oci://ghcr.io/s7n-systems/charts/stalwart --version 0.4.0 \
   --namespace stalwart -f my-values.yaml --set recoveryMode.enabled=true --timeout 15m
 kubectl --namespace stalwart port-forward svc/stalwart-management 8080:8080
 ```
@@ -177,6 +177,7 @@ The chart applies these settings with a `stalwart-cli apply` Job after every ins
 | `logging.console.enabled` (default) | Logs to stdout and disables the default log file |
 | `metrics.enabled`, `metrics.provision` | Enables the Prometheus exporter |
 | `encryption.provision` | Applies the server-wide encryption-at-rest switch (`encryption.atRestEnable`) |
+| `encryption.blobKey.existingSecret`, `blobStore.compression` | Creates the blob encryption key and sets blob compression, see [Blob encryption and compression](#blob-encryption-and-compression) |
 | `oidc.enabled` | Declares an OIDC directory; `oidc.activate` switches authentication to it |
 | `systemAccounts.accounts` | Creates system accounts; the reconcile Job writes their app passwords, see [System accounts](#system-accounts) |
 | `inMemoryStore.type` | Configures the shared in-memory store |
@@ -336,7 +337,43 @@ Stalwart validates bearer tokens without a client secret. The token audience mus
 
 External-directory accounts use app passwords for IMAP and SMTP; administrators cannot set their passwords. Accounts can be created on first OIDC login. Pre-create accounts that must receive mail before then. The chart does not provision ordinary users. Test administrator and mail-client logins before activation; the recovery administrator remains available.
 
-`encryption.provision: true` applies the server-wide `encryption.atRestEnable` switch (enabled by default in Stalwart). Each account must also enable encryption with a registered OpenPGP key or S/MIME certificate and choose whether to encrypt client-uploaded messages. This does not enable S3 bucket encryption.
+`encryption.provision: true` applies the server-wide `encryption.atRestEnable` switch (enabled by default in Stalwart). Each account must also enable encryption with a registered OpenPGP key or S/MIME certificate and choose whether to encrypt client-uploaded messages. This does not enable S3 bucket encryption; for that, see the next section.
+
+### Blob encryption and compression
+
+Stalwart can encrypt the blobs it stores (message bodies and attachments, and WebDAV files) with a key held by the server, so the blob store, such as an S3 provider, holds only ciphertext. Unlike encryption at rest, Stalwart can still read, index and search the messages. Headers, previews and the search index in the database are not covered.
+
+Create the key as 32 random bytes, base64-encoded, and keep a copy outside the cluster: blobs written with it cannot be read without it.
+
+```sh
+kubectl create secret generic stalwart-blob-key --from-literal=key="$(openssl rand -base64 32)"
+```
+
+```yaml
+encryption:
+  blobKey:
+    existingSecret: stalwart-blob-key
+blobStore:
+  compression: zstd   # optional: lz4 (Stalwart's default), zstd or none
+```
+
+The provisioning Job creates a `SymmetricKey` that reads the key from the `STALWART_BLOB_KEY` environment variable, so the key never appears in the plan. The reconcile Job then makes it the key for new mail and file blobs and restarts Stalwart. `encryption.blobKey.email: false` or `fileStorage: false` stops encrypting new blobs of that kind; blobs already encrypted stay readable as long as the key exists. Stalwart records the key's fingerprint: if the key in the Secret or `cipher` changes later, Stalwart refuses to load the key and cannot store new mail until the original key is back.
+
+Existing blobs keep their previous encryption and compression. To rewrite them, look up the key's id and start a `BlobRecode` task once through the management Service (`kubectl port-forward svc/<fullname>-management 8080:8080`):
+
+```sh
+curl -u admin:PASSWORD -H 'Content-Type: application/json' http://localhost:8080/jmap/ -d '{
+  "using": ["urn:ietf:params:jmap:core", "urn:stalwart:jmap"],
+  "methodCalls": [["x:SymmetricKey/get", {"properties": ["description"]}, "0"]]
+}'
+curl -u admin:PASSWORD -H 'Content-Type: application/json' http://localhost:8080/jmap/ -d '{
+  "using": ["urn:ietf:params:jmap:core", "urn:stalwart:jmap"],
+  "methodCalls": [["x:Task/set", {"create": {"recode": {"@type": "BlobRecode",
+    "compression": "keep", "encryption": {"@type": "Encrypt", "keyId": "KEY_ID"}}}}, "0"]]
+}'
+```
+
+`compression` takes `keep`, `disable`, `lz4` or `zstd`. Stalwart logs its progress as `store.blob-store-recoded`. Plaintext copies written before can survive the rewrite: in RocksDB until compaction, and in S3 object versions and backups.
 
 ### System accounts
 
@@ -412,9 +449,13 @@ provisioning:
 
 Without `jmapServerUrl`, Bulwark uses the internal management Service, which only works from inside the cluster. Serve Bulwark on its own host: its base path is fixed when the image is built.
 
-`webmail.oauth` adds Bulwark's own OAuth login, with its own client ID at the identity provider. Configure a secret for a confidential client; leave `existingSecret` and `clientSecret` empty for a public PKCE client. It is separate from Stalwart's `oidc` token validation and defaults its issuer to `oidc.issuerUrl`. `adminPassword` protects Bulwark's local admin dashboard, which is unrelated to Stalwart accounts.
+`webmail.oauth` adds Bulwark's own OAuth login, with its own client ID at the identity provider. Configure a secret for a confidential client; leave `existingSecret` and `clientSecret` empty for a public PKCE client. It is separate from Stalwart's `oidc` token validation and defaults its issuer to `oidc.issuerUrl`. Signing out also ends the session at the identity provider; set `oauth.endSession: false` when other apps share that session, `oauth.endSessionUrl` for providers without an `end_session_endpoint`, and `oauth.postLogoutRedirectUri` (registered at the provider) to return users to the login page. With `oauth.only`, `oauth.passwordFallback` keeps a password sign-in link for accounts outside single sign-on. `adminPassword` protects Bulwark's local admin dashboard, which is unrelated to Stalwart accounts.
 
-In local mode, Bulwark keeps state in `/app/data`. Enable `webmail.persistence.enabled` to preserve admin changes and synced settings across pod replacements. The default is a 1Gi `ReadWriteOnce` volume with the `Recreate` strategy; `webmail.strategy` overrides it. **On upgrades, preserve the current PVC size** (`2Gi` for the previous default): Kubernetes cannot shrink it.
+Stalwart 1.0.3 and later give an OAuth token access to Settings → Security (passwords, app passwords, API keys) and to the admin console only with Stalwart's own scopes, which Bulwark asks for only when configured. Set `webmail.oauth.extraScopes: "urn:stalwart:oauth:scope:full"` (or `urn:stalwart:oauth:scope:security urn:stalwart:oauth:scope:settings` without admin access), then allow them for Bulwark's client: in Stalwart, in the OAuthClient's `scopes` (only a superuser can allow `full`); with an external OpenID Connect provider, create the scopes there and assign them to the client. A scope the client may not use fails the sign-in with `invalid_scope`. Bulwark also adds the configured scopes to password sign-ins with two-factor authentication.
+
+`webmail.trustedProxyDepth` is the number of proxies in front of the pods that append `X-Forwarded-For`: 1 for an ingress controller or Gateway, 2 with a cloud load balancer in front of it. Sign-in limits and the audit log key on the client address it selects. `webmail.logFormat: json` suits log aggregation.
+
+In local mode, Bulwark keeps state in `/app/data`. Enable `webmail.persistence.enabled` to preserve admin changes and synced settings across pod replacements. The default is a 1Gi `ReadWriteOnce` volume with the `Recreate` strategy; `webmail.strategy` overrides it. `webmail.persistence.existingClaim` mounts an existing claim instead, such as a restored snapshot or a statically provisioned volume. **On upgrades, preserve the current PVC size** (`2Gi` for the previous default): Kubernetes cannot shrink it.
 
 Multiple replicas require `sharedStore`, `adminPassword` and `sessionSecret`. A shared filesystem cannot synchronize Bulwark's in-memory sign-in limits, leases and session revocations. Use a Redis-protocol store such as Valkey:
 
@@ -511,7 +552,29 @@ Stalwart runs as UID/GID 2000 with a read-only root filesystem, `RuntimeDefault`
 
 Stalwart and webmail pods have no Kubernetes permissions and mount no ServiceAccount token. The reconciliation Job uses a short-lived projected token. Its Roles allow `get`/`patch` on this release's StatefulSet and `get`/`update` on the named system-account Secrets. Each Secret namespace gets its own Role. StatefulSet patch permission permits changes to the whole specification, not just the restart annotation.
 
-The management Service is `ClusterIP`, but any pod in the cluster can reach it. Restrict it with a NetworkPolicy that allows the required clients: your Ingress controller or Gateway, Prometheus, Bulwark, the provisioning and reconcile Jobs, the certificate-reload Job and any external provisioning connector. The chart does not create NetworkPolicies.
+The management Service is `ClusterIP`, but any pod in the cluster can reach it. `networkPolicy.enabled` restricts ingress to the Stalwart and webmail pods:
+
+- **Mail ports** (`service.ports`) stay open to any source; `networkPolicy.mail.from` narrows them, for example to a relay network.
+- **Management port**: only this release's pods (webmail, provisioning, reconcile and certificate-reload Jobs) and the peers in `networkPolicy.management.from`. Add your Ingress controller or Gateway when they use the management backend (the chart refuses to render without one), Prometheus for metrics, and in-cluster clients such as a provisioning connector.
+- **Webmail port**: any source, or `networkPolicy.webmail.from`, normally the Ingress controller or Gateway.
+- `networkPolicy.extraIngress` appends rules to the Stalwart policy.
+
+```yaml
+networkPolicy:
+  enabled: true
+  management:
+    from:
+      - namespaceSelector:
+          matchLabels: {kubernetes.io/metadata.name: ingress-nginx}
+      - namespaceSelector:
+          matchLabels: {kubernetes.io/metadata.name: monitoring}
+  webmail:
+    from:
+      - namespaceSelector:
+          matchLabels: {kubernetes.io/metadata.name: ingress-nginx}
+```
+
+Egress is not restricted: Stalwart delivers mail to the internet and needs DNS, DNSBLs, ACME and its stores, and Bulwark its JMAP server and identity provider. The policies need a network plugin that enforces them.
 
 [policies/kyverno/](policies/kyverno/) contains optional Kyverno `ValidatingPolicy` resources for pod hardening, digest-pinned images and resource requests. The chart does not install them. They deny by default and apply cluster-wide, so scope them before using them on a shared cluster.
 
@@ -570,6 +633,7 @@ Bitnami Common is vendored in `charts/` and updated by Renovate together with `C
 | autoscaling.targetCPUUtilizationPercentage | int | `80` |  |
 | autoscaling.targetMemoryUtilizationPercentage | string | `""` |  |
 | blobStore.backend | string | `"s3"` |  |
+| blobStore.compression | string | `""` | Compression of new mail and file storage (WebDAV) blobs: lz4 (Stalwart's default), zstd or none. Empty leaves the setting unchanged. Existing blobs keep their compression until a BlobRecode task rewrites them. Requires provisioning credentials. |
 | blobStore.s3.accessKeyId | string | `""` | Fallback only, stored in a chart-managed Secret and visible in Helm's release history. Prefer existingSecret. Both are required together when existingSecret is not set. |
 | blobStore.s3.accessKeyIdSecretKey | string | `"accessKeyId"` |  |
 | blobStore.s3.allowInvalidCerts | bool | `false` |  |
@@ -623,6 +687,11 @@ Bitnami Common is vendored in `charts/` and updated by Renovate together with `C
 | dataStore.rocksdb.path | string | `"/var/lib/stalwart"` |  |
 | domain | string | `""` | Convenience base domain: when set and ingress.hosts / webmail.ingress.host are left at their defaults, they derive mail.<domain> and webmail.<domain> respectively. Set either explicitly to override this, or leave domain empty and set both explicitly yourself. |
 | encryption.atRestEnable | bool | `true` | Allows server-side encryption at rest for accounts that configured it. Matches Stalwart's default; false disables this encryption for new messages. |
+| encryption.blobKey.cipher | string | `"aes256Gcm"` | aes256Gcm or chacha20Poly1305. Do not change it, or the key in the Secret, once the key exists: Stalwart then refuses to load it and cannot store new mail. |
+| encryption.blobKey.email | bool | `true` | Encrypts new mail blobs with the key. false stops encrypting new mail blobs. |
+| encryption.blobKey.existingSecret | string | `""` | Secret holding the key: 32 random bytes, base64-encoded (openssl rand -base64 32). Keep a copy: blobs written with the key cannot be read without it. |
+| encryption.blobKey.fileStorage | bool | `true` | Encrypts new file storage (WebDAV) blobs with the key. false stops encrypting them. |
+| encryption.blobKey.secretKey | string | `"key"` | Key in existingSecret that holds the key. |
 | encryption.provision | bool | `false` | Reapplies atRestEnable on every install/upgrade. Requires provisioning credentials. |
 | existingSecret | string | `""` | Existing Secret containing environment variables; also accepts STALWART_RECOVERY_ADMIN. |
 | extraEnv | object | `{}` | Extra environment variables injected into the container, for non-sensitive settings. Overrides chart-generated values; extraEnvVars takes precedence. |
@@ -690,6 +759,11 @@ Bitnami Common is vendored in `charts/` and updated by Renovate together with `C
 | metrics.serviceMonitor.relabelings | list | `[]` |  |
 | metrics.serviceMonitor.scrapeTimeout | string | `""` |  |
 | nameOverride | string | `""` | Overrides the chart name used in resource names. |
+| networkPolicy.enabled | bool | `false` |  |
+| networkPolicy.extraIngress | list | `[]` | Extra ingress rules appended to the Stalwart policy as written. |
+| networkPolicy.mail.from | list | `[]` | NetworkPolicyPeers allowed to reach Stalwart's service.ports (mail and HTTPS). Empty allows any source, since mail clients and other mail servers connect from anywhere. E.g. an ipBlock for a submission-only relay network. |
+| networkPolicy.management.from | list | `[]` | NetworkPolicyPeers allowed to reach the management port (JMAP, admin API, metrics), in addition to this release's own pods (webmail, provisioning and reconcile Jobs). Add the ingress controller or Gateway when ingress or the HTTPRoute uses the management backend, Prometheus for metrics, and other in-cluster clients such as a provisioning connector. |
+| networkPolicy.webmail.from | list | `[]` | NetworkPolicyPeers allowed to reach the webmail port. Empty allows any source; normally the ingress controller's or Gateway's namespace. |
 | nodeSelector | object | `{}` | Node selector for the mail StatefulSet. |
 | oidc.acceptedAudiences | list | `[]` | Audiences accepted in a token's `aud` claim besides Stalwart's own resource identifiers, e.g. the client id an audience mapper in Keycloak adds. |
 | oidc.activate | bool | `false` | Activates this directory server-wide via the Authentication singleton's directoryId, replacing the internal directory for every protocol (IMAP, POP3, SMTP, JMAP) -- not only WebUI/JMAP -- since Stalwart has no per-protocol override. Stalwart's documentation does not confirm whether local/admin login keeps a fallback once this is set. Verify WebUI/admin access still works in a non-production environment before enabling this; leaving it false only declares the Directory object without switching any authentication over to it. |
@@ -825,8 +899,9 @@ Bitnami Common is vendored in `charts/` and updated by Renovate together with `C
 | webmail.containerSecurityContext.readOnlyRootFilesystem | bool | `true` |  |
 | webmail.containerSecurityContext.runAsNonRoot | bool | `true` |  |
 | webmail.enabled | bool | `false` |  |
-| webmail.extraEnv | object | `{}` | Extra environment variables for anything not exposed as its own value above (branding, PWA icons, cookie/CSP settings, logging, locale, etc.) -- see bulwarkmail.org's environment reference. |
+| webmail.extraEnv | object | `{}` | see bulwarkmail.org's environment reference. |
 | webmail.extraEnvVars | list | `[]` |  |
+| webmail.extraInitContainers | list | `[]` | Extra init containers for the webmail pod, e.g. to seed /app/data. |
 | webmail.extraVolumeMounts | list | `[]` |  |
 | webmail.extraVolumes | list | `[]` |  |
 | webmail.gatewayAPI.httpRoute.annotations | object | `{}` |  |
@@ -851,16 +926,22 @@ Bitnami Common is vendored in `charts/` and updated by Renovate together with `C
 | webmail.livenessProbe.periodSeconds | int | `15` |  |
 | webmail.livenessProbe.successThreshold | int | `1` |  |
 | webmail.livenessProbe.timeoutSeconds | int | `5` |  |
+| webmail.logFormat | string | `"text"` | `text` or `json` (for log aggregation). |
+| webmail.logLevel | string | `"info"` | `error`, `warn`, `info` or `debug`. |
 | webmail.nodeSelector | object | `{}` |  |
 | webmail.oauth.autoSso | bool | `false` | Starts the OAuth redirect automatically with no user interaction. Requires only: true. |
 | webmail.oauth.clientId | string | `""` |  |
 | webmail.oauth.clientSecret | string | `""` | Fallback only, stored in a chart-managed Secret. Prefer existingSecret. |
 | webmail.oauth.clientSecretKey | string | `"OAUTH_CLIENT_SECRET"` |  |
 | webmail.oauth.enabled | bool | `false` |  |
+| webmail.oauth.endSession | bool | `true` | Signing out also signs out of the identity provider (RP-initiated logout). Set false when the provider's session is shared with other apps that should stay signed in. |
+| webmail.oauth.endSessionUrl | string | `""` | Logout URL (https) for providers whose discovery document has no end_session_endpoint, such as Stalwart's built-in provider. |
 | webmail.oauth.existingSecret | string | `""` | Client secret for a confidential client. Leave existingSecret and clientSecret empty for a public client, which uses PKCE only. |
 | webmail.oauth.extraScopes | string | `""` |  |
 | webmail.oauth.issuerUrl | string | `""` | Defaults to the top-level oidc.issuerUrl when unset and oidc.enabled. |
 | webmail.oauth.only | bool | `false` | Hides the username/password form, making OAuth the only login method. |
+| webmail.oauth.passwordFallback | bool | `false` | Keeps a "Sign in with a password" link next to single sign-on, so SSO and password accounts work side by side. Requires only: true. |
+| webmail.oauth.postLogoutRedirectUri | string | `""` | Where the provider sends the browser after logout, e.g. https://webmail.example.org/en/login. Register it at the provider first. |
 | webmail.oauth.scopes | string | `""` |  |
 | webmail.pdb.create | bool | `true` | Create the PodDisruptionBudget for multi-replica installs. |
 | webmail.pdb.maxUnavailable | int | `1` | Pods that may be evicted at once. Ignored when minAvailable is set. |
@@ -868,17 +949,18 @@ Bitnami Common is vendored in `charts/` and updated by Renovate together with `C
 | webmail.persistence.accessMode | string | `"ReadWriteOnce"` |  |
 | webmail.persistence.annotations | object | `{}` | E.g. helm.sh/resource-policy: keep, so the volume survives when persistence is disabled after moving to sharedStore. |
 | webmail.persistence.enabled | bool | `false` |  |
+| webmail.persistence.existingClaim | string | `""` | Mount this PersistentVolumeClaim instead of creating one, e.g. a restored snapshot or a statically provisioned volume. size, storageClass and annotations then do not apply; set accessMode to the claim's mode. |
 | webmail.persistence.size | string | `"1Gi"` | Local state capacity. Preserve the current PVC size on upgrades; Kubernetes cannot shrink claims (the previous default was 2Gi). |
 | webmail.persistence.storageClass | string | `""` |  |
 | webmail.podAnnotations | object | `{}` |  |
 | webmail.podAntiAffinityPreset | string | `""` | Spreads replicas across nodes when affinity is left empty: "", "soft", or "hard" -- see the top-level podAntiAffinityPreset for details. |
 | webmail.podLabels | object | `{}` |  |
 | webmail.podSecurityContext.enabled | bool | `true` |  |
-| webmail.podSecurityContext.fsGroup | int | `1000` | The published image's non-root user; adjust if a custom image uses a different UID/GID. |
+| webmail.podSecurityContext.fsGroup | int | `1001` | The published image's non-root user (nextjs, UID 1001); adjust if a custom image uses a different UID/GID. |
 | webmail.podSecurityContext.fsGroupChangePolicy | string | `"OnRootMismatch"` |  |
-| webmail.podSecurityContext.runAsGroup | int | `1000` |  |
+| webmail.podSecurityContext.runAsGroup | int | `1001` |  |
 | webmail.podSecurityContext.runAsNonRoot | bool | `true` |  |
-| webmail.podSecurityContext.runAsUser | int | `1000` |  |
+| webmail.podSecurityContext.runAsUser | int | `1001` |  |
 | webmail.podSecurityContext.seccompProfile.type | string | `"RuntimeDefault"` |  |
 | webmail.readinessProbe.enabled | bool | `true` |  |
 | webmail.readinessProbe.failureThreshold | int | `3` |  |
@@ -916,6 +998,7 @@ Bitnami Common is vendored in `charts/` and updated by Renovate together with `C
 | webmail.strategy | object | `{}` | Deployment strategy. Empty uses Recreate with a ReadWriteOnce volume, which a new pod cannot attach while the old one holds it, and RollingUpdate otherwise. |
 | webmail.telemetry.enabled | bool | `true` |  |
 | webmail.tolerations | list | `[]` |  |
+| webmail.trustedProxyDepth | int | `1` | Reverse proxies in front of the pods that append X-Forwarded-For: 1 for an ingress controller or Gateway alone, 2 with a cloud load balancer in front of it. Sign-in limits and the audit log use the client address this selects. |
 
 </details>
 

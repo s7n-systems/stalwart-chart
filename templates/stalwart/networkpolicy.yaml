@@ -1,0 +1,50 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $viaManagement := or (and .Values.ingress.enabled (eq .Values.ingress.backend "management")) (and .Values.gatewayAPI.httpRoute.enabled (eq .Values.gatewayAPI.httpRoute.backend "management")) }}
+{{- if and $viaManagement (not .Values.networkPolicy.management.from) }}
+{{- fail "networkPolicy.management.from must allow the ingress controller or Gateway: ingress or gatewayAPI.httpRoute uses the management backend, which the policy otherwise closes to them" }}
+{{- end }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "stalwart.fullname" . }}
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "stalwart.labels" . | nindent 4 }}
+  {{- with .Values.additionalAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "stalwart.serverSelectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    {{- if .Values.service.ports }}
+    # Mail and HTTPS listeners (service.ports).
+    - ports:
+        {{- range $name, $port := .Values.service.ports }}
+        - port: {{ $name }}
+          protocol: {{ $port.protocol | default "TCP" }}
+        {{- end }}
+      {{- with .Values.networkPolicy.mail.from }}
+      from:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    {{- end }}
+    # Management listener: this release's pods and networkPolicy.management.from.
+    - ports:
+        - port: mgmt
+          protocol: TCP
+      from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name | quote }}
+        {{- with .Values.networkPolicy.management.from }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    {{- with .Values.networkPolicy.extraIngress }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}

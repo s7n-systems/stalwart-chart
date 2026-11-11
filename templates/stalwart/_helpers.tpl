@@ -148,7 +148,7 @@ maxUnavailable: {{ .maxUnavailable }}
 {{- fail "blobStore.s3 requires existingSecret, or both accessKeyId and secretKey" -}}
 {{- end -}}
 {{- if and (eq (include "stalwart.cliCredentialsNeeded" .) "true") (not .Values.provisioning.existingSecret) (not .Values.provisioning.password) -}}
-{{- fail "provisioning.existingSecret or provisioning.password is required when S3 blob-store, metrics, encryption, OIDC or extra provisioning, console logging, or certificateReload is enabled" -}}
+{{- fail "provisioning.existingSecret or provisioning.password is required when S3 blob-store, metrics, encryption, blob compression, OIDC or extra provisioning, console logging, or certificateReload is enabled" -}}
 {{- end -}}
 {{- if and (eq .Values.coordinator.type "nats") (not .Values.coordinator.nats.hosts) -}}
 {{- fail "coordinator.nats.hosts is required when coordinator.type=nats" -}}
@@ -233,6 +233,29 @@ true
      (Stalwart 1.0.2; it replaced Email.encryptAtRest). */}}
 {{- define "stalwart.encryptionPlan" -}}
 {{- dict "@type" "update" "object" "Encryption" "value" (dict "atRestEnable" .Values.encryption.atRestEnable) | toJson -}}
+{{- end -}}
+
+{{/* Description that identifies the chart's SymmetricKey (encryption.blobKey). */}}
+{{- define "stalwart.blobKeyDescription" -}}
+Helm chart blob key
+{{- end -}}
+
+{{/* Blob compression and server-side blob encryption (Stalwart 1.0.3). The SymmetricKey reads
+     its secret from STALWART_BLOB_KEY, so the key never enters the plan; it is matched by its
+     description. Stalwart (1.0.3 to 1.1.0) does not resolve #references in blobEncryptionKey, so the
+     reconcile Job points Email and FileStorage at the key by its id. */}}
+{{- define "stalwart.blobPlan" -}}
+{{- $k := .Values.encryption.blobKey -}}
+{{- $lines := list -}}
+{{- if $k.existingSecret -}}
+{{- $key := dict "description" (include "stalwart.blobKeyDescription" .) "cipher" $k.cipher "key" (dict "@type" "EnvironmentVariable" "variableName" "STALWART_BLOB_KEY") -}}
+{{- $lines = append $lines (dict "@type" "upsert" "object" "SymmetricKey" "matchOn" (list "description") "value" (dict "blob-key" $key) | toJson) -}}
+{{- end -}}
+{{- with .Values.blobStore.compression -}}
+{{- $lines = append $lines (dict "@type" "update" "object" "Email" "value" (dict "compressionAlgorithm" .) | toJson) -}}
+{{- $lines = append $lines (dict "@type" "update" "object" "FileStorage" "value" (dict "compressionAlgorithm" .) | toJson) -}}
+{{- end -}}
+{{- join "\n" $lines -}}
 {{- end -}}
 
 {{/* Stalwart serializes Set<T> fields as objects of value->true (e.g.
@@ -391,7 +414,7 @@ true
 
 {{/* True when the CLI apply Job has at least one plan line to run. */}}
 {{- define "stalwart.provisioningEnabled" -}}
-{{- if or (eq .Values.blobStore.backend "s3") (and .Values.metrics.enabled .Values.metrics.provision) .Values.encryption.provision .Values.oidc.enabled .Values.inMemoryStore.type .Values.coordinator.type .Values.systemAccounts.accounts .Values.provisioning.extraPlan .Values.logging.console.enabled .Values.hostname -}}
+{{- if or (eq .Values.blobStore.backend "s3") (and .Values.metrics.enabled .Values.metrics.provision) .Values.encryption.provision .Values.encryption.blobKey.existingSecret .Values.blobStore.compression .Values.oidc.enabled .Values.inMemoryStore.type .Values.coordinator.type .Values.systemAccounts.accounts .Values.provisioning.extraPlan .Values.logging.console.enabled .Values.hostname -}}
 true
 {{- end -}}
 {{- end -}}
@@ -426,6 +449,9 @@ true
 {{- end -}}
 {{- if .Values.encryption.provision -}}
 {{- $lines = append $lines (include "stalwart.encryptionPlan" .) -}}
+{{- end -}}
+{{- with include "stalwart.blobPlan" . -}}
+{{- $lines = concat $lines (splitList "\n" .) -}}
 {{- end -}}
 {{- if .Values.inMemoryStore.type -}}
 {{- $lines = append $lines (dict "@type" "update" "object" "InMemoryStore" "value" (dict "@type" "Redis" "url" .Values.inMemoryStore.redis.url) | toJson) -}}
