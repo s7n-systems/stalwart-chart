@@ -1298,5 +1298,116 @@ class ChartChecks(unittest.TestCase):
         render({**domain, 'networkPolicy': {'enabled': True, 'management': {'from': [ingress_nginx]}}, 'ingress': {'enabled': True}})
         render({**domain, 'networkPolicy': {'enabled': True}, 'ingress': {'enabled': True, 'backend': 'mail'}})
 
+    def test_webmail_branding(self):
+        def deployment(docs):
+            return next(d for d in docs if d['kind'] == 'Deployment')['spec']['template']
+
+        def env(docs):
+            return {e['name']: e.get('value') for e in deployment(docs)['spec']['containers'][0]['env']}
+
+        # Nothing set: Bulwark keeps its defaults, and no ConfigMap or volume is added.
+        docs = render({'webmail': {'enabled': True}})
+        self.assertFalse(any(name in env(docs) for name in ('FAVICON_URL', 'LOGIN_LOGO_LIGHT_URL', 'DOMAIN_BRANDING')))
+        self.assertFalse(any(d['kind'] == 'ConfigMap' and d['metadata']['name'].endswith('-branding') for d in docs))
+        self.assertNotIn('branding', [v['name'] for v in deployment(docs)['spec']['volumes']])
+        self.assertNotIn('checksum/branding', deployment(docs)['metadata']['annotations'])
+
+        branding = {'files': {'logo.svg': '<svg/>'}, 'binaryFiles': {'favicon.png': 'iVBORw0KGgo='},
+                    'favicon': '/branding/custom/favicon.png', 'themeColor': '#571efa',
+                    'appLogo': {'light': '/branding/custom/logo.svg'},
+                    'login': {'logo': {'light': 'https://cdn.example.org/logo.svg', 'maxHeight': '96px'}, 'layout': 'split',
+                              'background': {'dim': 30}, 'companyName': 'Example'},
+                    'palette': {'light': {'primary': '#571efa', 'primary-foreground': '#ffffff'}}}
+        docs = render({'domain': 'example.org', 'webmail': {'enabled': True, 'branding': branding}})
+        values = env(docs)
+        self.assertEqual((values['FAVICON_URL'], values['PWA_THEME_COLOR'], values['APP_LOGO_LIGHT_URL'], values['LOGIN_LOGO_LIGHT_URL']),
+                         ('/branding/custom/favicon.png', '#571efa', '/branding/custom/logo.svg', 'https://cdn.example.org/logo.svg'))
+        self.assertEqual((values['LOGIN_LOGO_MAX_HEIGHT'], values['LOGIN_LAYOUT'], values['LOGIN_BACKGROUND_DIM'], values['LOGIN_COMPANY_NAME']),
+                         ('96px', 'split', '30', 'Example'))
+        self.assertNotIn('APP_LOGO_DARK_URL', values)
+        self.assertEqual(json.loads(values['DOMAIN_BRANDING']),
+                         [{'host': 'webmail.example.org', 'palette': {'light': {'primary': '#571efa', 'primary-foreground': '#ffffff'}}}])
+        configmap = next(d for d in docs if d['kind'] == 'ConfigMap' and d['metadata']['name'] == 'stalwart-webmail-branding')
+        self.assertEqual((configmap['data'], configmap['binaryData']), ({'logo.svg': '<svg/>'}, {'favicon.png': 'iVBORw0KGgo='}))
+        template = deployment(docs)
+        self.assertIn({'name': 'branding', 'configMap': {'name': 'stalwart-webmail-branding'}}, template['spec']['volumes'])
+        self.assertIn({'name': 'branding', 'mountPath': '/app/public/branding/custom', 'readOnly': True},
+                      template['spec']['containers'][0]['volumeMounts'])
+        checksum = template['metadata']['annotations']['checksum/branding']
+        changed = {**branding, 'files': {'logo.svg': '<svg></svg>'}}
+        self.assertNotEqual(checksum, deployment(render({'domain': 'example.org', 'webmail': {'enabled': True, 'branding': changed}}))['metadata']['annotations']['checksum/branding'])
+
+        # An existing ConfigMap is mounted as is, without a checksum.
+        docs = render({'webmail': {'enabled': True, 'branding': {'existingConfigMap': 'brand', 'files': {'x.svg': '<svg/>'}}}})
+        self.assertIn({'name': 'branding', 'configMap': {'name': 'brand'}}, deployment(docs)['spec']['volumes'])
+        self.assertNotIn('checksum/branding', deployment(docs)['metadata']['annotations'])
+        self.assertFalse(any(d['kind'] == 'ConfigMap' and d['metadata']['name'].endswith('-branding') for d in docs))
+
+        # The palette follows the HTTPRoute's hostnames; a domains entry for a host replaces it.
+        palette = {'light': {'primary': '#571efa'}}
+        route = {'enabled': True, 'parentRefs': [{'name': 'gw'}], 'hostnames': ['mail.example.org', 'webmail.example.com']}
+        docs = render({'webmail': {'enabled': True, 'gatewayAPI': {'httpRoute': route},
+                                   'branding': {'palette': palette, 'domains': [{'host': 'Mail.example.org', 'loginCompanyName': 'Own'}]}}})
+        self.assertEqual(json.loads(env(docs)['DOMAIN_BRANDING']), [
+            {'host': 'Mail.example.org', 'loginCompanyName': 'Own'}, {'host': 'webmail.example.com', 'palette': palette}])
+        docs = render({'webmail': {'enabled': True, 'branding': {'domains': [{'host': 'mail.example.org', 'appName': 'Mail'}]}}})
+        self.assertEqual(json.loads(env(docs)['DOMAIN_BRANDING']), [{'host': 'mail.example.org', 'appName': 'Mail'}])
+        # Bulwark prefers the exact palette entry over a wildcard, so the most specific matching
+        # wildcard is merged into it; its palette colours win. Non-matching wildcards stay apart.
+        domains = [{'host': '*.org', 'loginCompanyName': 'Broad'},
+                   {'host': '*.Example.org', 'loginCompanyName': 'Example', 'appLogoLightUrl': '/branding/custom/x.svg',
+                    'palette': {'light': {'accent': '#00ff00', 'primary': '#111111'}}},
+                   {'host': '*.example.com', 'loginCompanyName': 'Other'}]
+        docs = render({'domain': 'example.org', 'webmail': {'enabled': True, 'branding': {
+            'palette': {'light': {'primary': '#571efa', 'primary-foreground': '#ffffff'}, 'dark': {'primary': '#9b7bff'}},
+            'domains': domains}}})
+        self.assertEqual(json.loads(env(docs)['DOMAIN_BRANDING']), domains + [{
+            'host': 'webmail.example.org', 'loginCompanyName': 'Example', 'appLogoLightUrl': '/branding/custom/x.svg',
+            'palette': {'light': {'primary': '#111111', 'primary-foreground': '#ffffff', 'accent': '#00ff00'},
+                        'dark': {'primary': '#9b7bff'}}}])
+        # A wildcard does not match its own apex.
+        docs = render({'webmail': {'enabled': True, 'ingress': {'host': 'example.org'},
+                                   'branding': {'palette': palette, 'domains': [{'host': '*.example.org', 'appName': 'Sub'}]}}})
+        self.assertEqual(json.loads(env(docs)['DOMAIN_BRANDING'])[1], {'host': 'example.org', 'palette': palette})
+        error = render({'webmail': {'enabled': True, 'branding': {'palette': palette}}}, succeeds=False)
+        self.assertIn('webmail.branding.palette requires the webmail hostname', error)
+
+        for invalid in ({'favicon': 'javascript:alert(1)'}, {'favicon': '//evil.example/x.svg'}, {'themeColor': 'purple'},
+                        {'login': {'layout': 'grid'}}, {'login': {'background': {'dim': 90}}},
+                        {'palette': {'light': {'primary': 'blue'}}}, {'palette': {'light': {'border': '#000000'}}},
+                        {'files': {'../logo.svg': '<svg/>'}}, {'domains': [{'appName': 'no host'}]}):
+            render({'domain': 'example.org', 'webmail': {'enabled': True, 'branding': invalid}}, succeeds=False)
+
+    def test_enterprise(self):
+        def env(docs):
+            return {e['name']: e for e in workload(docs)['spec']['template']['spec']['containers'][0]['env'] or []}
+
+        def enterprise(docs):
+            return [line for line in plan_lines(docs) if line['object'] == 'Enterprise']
+
+        docs = render({'provisioning': {'existingSecret': 'admin'}, 'hostname': 'mail.example.org', 'domain': 'example.org'})
+        self.assertEqual(enterprise(docs), [])
+        self.assertFalse({'STALWART_LICENSE_KEY', 'STALWART_ENTERPRISE_API_KEY'} & set(env(docs)))
+
+        # The license key reaches Stalwart through the environment, never the plan.
+        docs = render({'provisioning': {'existingSecret': 'admin'},
+                       'enterprise': {'licenseKey': {'existingSecret': 'license'}, 'logo': 'data:image/svg+xml;base64,PHN2Zy8+'}})
+        self.assertEqual(enterprise(docs), [{'@type': 'update', 'object': 'Enterprise', 'value': {
+            'licenseKey': {'@type': 'EnvironmentVariable', 'variableName': 'STALWART_LICENSE_KEY'},
+            'logo': 'data:image/svg+xml;base64,PHN2Zy8+'}}])
+        self.assertEqual(env(docs)['STALWART_LICENSE_KEY']['valueFrom'], {'secretKeyRef': {'name': 'license', 'key': 'license-key'}})
+        # With the API key only, the license that Stalwart renews and stores is left alone.
+        docs = render({'provisioning': {'existingSecret': 'admin'}, 'enterprise': {'apiKey': {'existingSecret': 'ent', 'secretKey': 'key'}}})
+        self.assertEqual(enterprise(docs), [{'@type': 'update', 'object': 'Enterprise', 'value': {
+            'apiKey': {'@type': 'EnvironmentVariable', 'variableName': 'STALWART_ENTERPRISE_API_KEY'}}}])
+        self.assertEqual(env(docs)['STALWART_ENTERPRISE_API_KEY']['valueFrom'], {'secretKeyRef': {'name': 'ent', 'key': 'key'}})
+        self.assertNotIn('STALWART_LICENSE_KEY', env(docs))
+
+        error = render({'enterprise': {'logo': 'https://example.org/logo.svg'}}, succeeds=False)
+        self.assertIn('provisioning.existingSecret or provisioning.password is required', error)
+        error = render({'provisioning': {'existingSecret': 'admin'},
+                        'enterprise': {'apiKey': {'existingSecret': 'ent'}, 'licenseKey': {'existingSecret': 'license'}}}, succeeds=False)
+        self.assertIn('enterprise.apiKey and enterprise.licenseKey are exclusive', error)
+
 if __name__ == '__main__':
     unittest.main()

@@ -159,6 +159,7 @@ true
 - name: APP_NAME
   value: {{ .Values.webmail.appName | quote }}
 {{- end }}
+{{- include "stalwart.webmailBrandingEnv" . }}
 - name: STALWART_FEATURES
   value: {{ .Values.webmail.stalwartFeatures | quote }}
 - name: SETTINGS_SYNC_ENABLED
@@ -267,3 +268,100 @@ true
 {{- end }}
 {{- end }}
 {{- end }}
+
+{{/* The ConfigMap with the branding files, or "" when there are none. */}}
+{{- define "stalwart.webmailBrandingConfigMap" -}}
+{{- $b := .Values.webmail.branding -}}
+{{- if $b.existingConfigMap -}}
+{{- $b.existingConfigMap -}}
+{{- else if or $b.files $b.binaryFiles -}}
+{{- printf "%s-branding" (include "stalwart.webmailFullname" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Hostnames the palette applies to: the webmail's own, as the HTTPRoute or Ingress serves it. */}}
+{{- define "stalwart.webmailPaletteHosts" -}}
+{{- $route := .Values.webmail.gatewayAPI.httpRoute -}}
+{{- if and $route.enabled $route.hostnames -}}
+{{- $route.hostnames | toJson -}}
+{{- else if or .Values.webmail.ingress.host .Values.domain -}}
+{{- list (include "stalwart.webmailIngressHost" .) | toJson -}}
+{{- else -}}
+{{- fail "webmail.branding.palette requires the webmail hostname: webmail.ingress.host, webmail.gatewayAPI.httpRoute.hostnames or a top-level domain; or set the palette per host in webmail.branding.domains" -}}
+{{- end -}}
+{{- end -}}
+
+{{/* DOMAIN_BRANDING: the domains entries, then a palette entry for each webmail hostname
+     without an exact entry. Bulwark prefers an exact host over a wildcard, so the generated
+     entry carries the settings of the most specific matching "*." entry, whose own palette
+     colours win over branding.palette. */}}
+{{- define "stalwart.webmailDomainBranding" -}}
+{{- $b := .Values.webmail.branding -}}
+{{- $entries := $b.domains | default list -}}
+{{- $palette := dict -}}
+{{- with $b.palette.light }}{{ $_ := set $palette "light" . }}{{ end -}}
+{{- with $b.palette.dark }}{{ $_ := set $palette "dark" . }}{{ end -}}
+{{- if $palette -}}
+{{- $generated := list -}}
+{{- range $host := include "stalwart.webmailPaletteHosts" . | fromJsonArray -}}
+{{- $exact := false -}}
+{{- $wildcard := dict -}}
+{{- $suffixLength := 0 -}}
+{{- range $entries -}}
+{{- $pattern := lower .host -}}
+{{- if eq $pattern (lower $host) -}}
+{{- $exact = true -}}
+{{- else if hasPrefix "*." $pattern -}}
+{{- $suffix := trimPrefix "*" $pattern -}}
+{{- if and (hasSuffix $suffix (lower $host)) (gt (len $suffix) $suffixLength) -}}
+{{- $wildcard = . -}}
+{{- $suffixLength = len $suffix -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if not $exact -}}
+{{- $entry := omit (deepCopy $wildcard) "host" "palette" -}}
+{{- $_ := set $entry "host" $host -}}
+{{- $_ := set $entry "palette" (mergeOverwrite (deepCopy $palette) (deepCopy ($wildcard.palette | default dict))) -}}
+{{- $generated = append $generated $entry -}}
+{{- end -}}
+{{- end -}}
+{{- $entries = concat $entries $generated -}}
+{{- end -}}
+{{- if $entries }}{{ $entries | toJson }}{{ end -}}
+{{- end -}}
+
+{{/* Branding environment from webmail.branding; empty values keep Bulwark's defaults. */}}
+{{- define "stalwart.webmailBrandingEnv" -}}
+{{- $b := .Values.webmail.branding -}}
+{{- $l := $b.login -}}
+{{- $vars := list
+  (list "APP_SHORT_NAME" $b.shortName)
+  (list "FAVICON_URL" $b.favicon)
+  (list "PWA_ICON_URL" $b.pwaIcon)
+  (list "PWA_THEME_COLOR" $b.themeColor)
+  (list "PWA_BACKGROUND_COLOR" $b.backgroundColor)
+  (list "APP_LOGO_LIGHT_URL" $b.appLogo.light)
+  (list "APP_LOGO_DARK_URL" $b.appLogo.dark)
+  (list "LOGIN_LOGO_LIGHT_URL" $l.logo.light)
+  (list "LOGIN_LOGO_DARK_URL" $l.logo.dark)
+  (list "LOGIN_LOGO_MAX_HEIGHT" $l.logo.maxHeight)
+  (list "LOGIN_LOGO_MAX_WIDTH" $l.logo.maxWidth)
+  (list "LOGIN_LAYOUT" $l.layout)
+  (list "LOGIN_BACKGROUND_LIGHT_URL" $l.background.light)
+  (list "LOGIN_BACKGROUND_DARK_URL" $l.background.dark)
+  (list "LOGIN_BACKGROUND_DIM" $l.background.dim)
+  (list "LOGIN_BACKGROUND_BLUR" $l.background.blur)
+  (list "LOGIN_COMPANY_NAME" $l.companyName)
+  (list "LOGIN_WEBSITE_URL" $l.websiteUrl)
+  (list "LOGIN_IMPRINT_URL" $l.imprintUrl)
+  (list "LOGIN_PRIVACY_POLICY_URL" $l.privacyPolicyUrl)
+  (list "DOMAIN_BRANDING" (include "stalwart.webmailDomainBranding" .))
+-}}
+{{- range $vars }}
+{{- if ne (toString (index . 1)) "" }}
+- name: {{ index . 0 }}
+  value: {{ index . 1 | toString | quote }}
+{{- end }}
+{{- end }}
+{{- end -}}

@@ -1,0 +1,21 @@
+{{- if and .Values.webmail.enabled (not .Values.webmail.branding.existingConfigMap) (or .Values.webmail.branding.files .Values.webmail.branding.binaryFiles) }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "stalwart.webmailBrandingConfigMap" . }}
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "stalwart.webmailLabels" . | nindent 4 }}
+  {{- with .Values.webmail.additionalAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- with .Values.webmail.branding.files }}
+data:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- with .Values.webmail.branding.binaryFiles }}
+binaryData:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- end }}

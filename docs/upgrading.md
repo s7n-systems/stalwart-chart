@@ -1,5 +1,12 @@
 # Upgrading
 
+## Chart 0.5.0: webmail branding, Stalwart Enterprise settings
+
+No steps are needed: the new values are off or empty by default.
+
+- New `webmail.branding`: Bulwark's logos, icons, colours and login page, with logo files served from a ConfigMap at `/branding/custom/<name>`. It replaces branding variables in `webmail.extraEnv` (`FAVICON_URL`, `APP_LOGO_*`, `LOGIN_LOGO_*`, `LOGIN_LAYOUT`, `LOGIN_BACKGROUND_*`, `LOGIN_COMPANY_NAME`, `DOMAIN_BRANDING` and others); variables left in `extraEnv` still take precedence. See the README's [Branding](../README.md#branding).
+- New `enterprise` for Stalwart Enterprise edition settings, which need a paid license: the license from a Secret (`enterprise.apiKey` or `enterprise.licenseKey`) and the WebUI's default logo (`enterprise.logo`). A license already entered in the WebUI stays in place; set one of the keys only to manage it from a Secret. See the README's [Enterprise edition](../README.md#enterprise-edition).
+
 ## Chart 0.4.0: Stalwart 1.1.0, Bulwark 1.21.1
 
 Stalwart 1.0.3 and 1.1.0:

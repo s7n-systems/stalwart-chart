@@ -49,7 +49,7 @@ The chart deploys Stalwart 1.0 as a StatefulSet and configures it the way Stalwa
 - [Configuration](#configuration)
   - [Images](#images) · [Credentials](#credentials) · [Storage](#storage) · [Server settings](#server-settings)
   - [Networking](#networking) · [TLS certificates](#tls-certificates) · [Monitoring](#monitoring) · [Authentication](#authentication)
-  - [System accounts](#system-accounts) · [Webmail](#webmail) · [Scaling](#scaling) · [Security](#security)
+  - [Enterprise edition](#enterprise-edition) · [System accounts](#system-accounts) · [Webmail](#webmail) · [Scaling](#scaling) · [Security](#security)
 - [Operations](#operations)
 - [Development](#development)
 - [Values](#values)
@@ -60,14 +60,14 @@ The chart deploys Stalwart 1.0 as a StatefulSet and configures it the way Stalwa
 | | |
 | --- | --- |
 | **Storage** | External PostgreSQL (default) or local RocksDB as the database; S3 or any S3-compatible service for mail blobs |
-| **Declarative settings** | Blob store, server hostname and default domain, Prometheus exporter, logging, OIDC directory, in-memory store, cluster coordinator, encryption at rest, blob encryption and compression applied by a CLI Job; anything else through `provisioning.extraPlan` |
+| **Declarative settings** | Blob store, server hostname and default domain, Prometheus exporter, logging, OIDC directory, in-memory store, cluster coordinator, encryption at rest, blob encryption and compression, Enterprise license and logo applied by a CLI Job; anything else through `provisioning.extraPlan` |
 | **System accounts** | Send-only accounts for other applications, with app passwords published to Secrets |
 | **Exposure** | Mail Service for SMTP, IMAP, POP3 and ManageSieve (LoadBalancer or NodePort); Ingress or Gateway API HTTPRoute for the web UI, JMAP and DAV; Gateway API TCPRoutes for mail ports; dual-stack |
 | **Scaling** | HorizontalPodAutoscaler with a conservative scale-down, PodDisruptionBudget, anti-affinity presets, topology spread, NATS/Redis/Kafka/Zenoh coordination |
 | **Security** | Non-root, read-only root filesystem, all capabilities dropped except `NET_BIND_SERVICE`, no ServiceAccount token in the Stalwart and webmail pods, images pinned by digest, optional NetworkPolicies and Kyverno policies |
 | **Observability** | Prometheus exporter with optional Basic authentication and ServiceMonitor; logs to stdout |
 | **Certificates** | Mounted certificates (for example from cert-manager) reloaded on a schedule without restarting pods |
-| **Webmail** | Bulwark JMAP webmail with OAuth/OIDC login, its own autoscaling, PDB and persistence |
+| **Webmail** | Bulwark JMAP webmail with OAuth/OIDC login, branding (logos, colours, login page), its own autoscaling, PDB and persistence |
 | **Supply chain** | Chart published to GHCR as an OCI artifact and signed with cosign; Renovate keeps images, actions and tools current |
 
 ## Requirements
@@ -102,7 +102,7 @@ Copy the example to `my-values.yaml`, set the database host, bucket, `hostname` 
 
 ```sh
 helm upgrade --install stalwart oci://ghcr.io/s7n-systems/charts/stalwart \
-  --version 0.4.0 --namespace stalwart -f my-values.yaml --timeout 15m
+  --version 0.5.0 --namespace stalwart -f my-values.yaml --timeout 15m
 ```
 
 The chart validates required storage settings and credential references before rendering. It cannot check whether referenced Secrets exist or whether external services are reachable; these failures can still leave an incomplete installation. To install from a checkout instead, use `.` as the chart: Bitnami Common is vendored in `charts/`, so no dependency download is needed.
@@ -112,7 +112,7 @@ The chart validates required storage settings and credential references before r
 Release builds are signed keylessly with cosign 3 from this repository's release workflow. Cosign 3 stores the signature as an OCI referrer in the new bundle format; verify with cosign 3 or newer (cosign 2 reports "no signatures found"):
 
 ```sh
-cosign verify ghcr.io/s7n-systems/charts/stalwart:0.4.0 \
+cosign verify ghcr.io/s7n-systems/charts/stalwart:0.5.0 \
   --certificate-identity-regexp '^https://github\.com/s7n-systems/stalwart-chart/\.github/workflows/release\.yml@' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
@@ -122,7 +122,7 @@ cosign verify ghcr.io/s7n-systems/charts/stalwart:0.4.0 \
 For an interactive first-time setup, use recovery mode, which suspends mail services and opens only the management listener. You can instead provision domains and other settings through `provisioning.extraPlan` during a normal installation.
 
 ```sh
-helm upgrade --install stalwart oci://ghcr.io/s7n-systems/charts/stalwart --version 0.4.0 \
+helm upgrade --install stalwart oci://ghcr.io/s7n-systems/charts/stalwart --version 0.5.0 \
   --namespace stalwart -f my-values.yaml --set recoveryMode.enabled=true --timeout 15m
 kubectl --namespace stalwart port-forward svc/stalwart-management 8080:8080
 ```
@@ -375,6 +375,29 @@ curl -u admin:PASSWORD -H 'Content-Type: application/json' http://localhost:8080
 
 `compression` takes `keep`, `disable`, `lz4` or `zstd`. Stalwart logs its progress as `store.blob-store-recoded`. Plaintext copies written before can survive the rewrite: in RocksDB until compaction, and in S3 object versions and backups.
 
+### Enterprise edition
+
+The settings under `enterprise` need a paid **Enterprise license** from [Stalwart Labs](https://stalw.art/pricing/) (sponsors on OpenCollective get one too). Without a valid license, Stalwart logs a configuration warning and runs as the community edition: it ignores them and keeps working. They require provisioning credentials.
+
+The license can come from a Secret instead of the WebUI. A license is issued for the server's hostname (`hostname`) and a number of accounts. With an API key, Stalwart downloads the license and renews it before it expires; with a license key, replace the Secret before the license expires:
+
+```yaml
+enterprise:
+  apiKey:
+    existingSecret: stalwart-enterprise   # key api-key
+  # or a fixed license:
+  # licenseKey:
+  #   existingSecret: stalwart-license    # key license-key
+  logo: "data:image/svg+xml;base64,PHN2Zy..."   # base64 -w0 logo.svg
+```
+
+Set one of the two: Stalwart stores the license it renews in place of the configured key, which the chart would overwrite on every upgrade. Stalwart reads the key only at startup, and the chart cannot see changes to your Secret, so restart Stalwart after replacing it:
+
+```sh
+kubectl -n <namespace> rollout restart statefulset/<fullname>
+```
+ `enterprise.logo` is the default logo of Stalwart's web interface and login pages: a data URI, a base64-encoded image or an http(s) URL, at most 1 MiB. Domains and tenants can override it in the WebUI. Clearing a value later leaves the stored setting in place; change it in the WebUI.
+
 ### System accounts
 
 Other applications that send mail, such as notifications or password resets, need an account with a password. Once authentication runs through an external directory (`oidc.activate`), Stalwart refuses passwords an administrator sets; it only accepts app passwords it generates itself and shows once. `systemAccounts.accounts` covers this: the provisioning Job creates each account, and the reconcile Job creates an app password for it and writes it into a Secret that the applications read.
@@ -481,6 +504,38 @@ The chart does not deploy the store. It holds admin config (including OAuth clie
 - authentication and `rediss://` across untrusted networks.
 
 Stalwart's `inMemoryStore` can share the same server if it meets these requirements. Set `sharedStore.keyPrefix` per release when sharing a store. While the store is unreachable, `/api/ready` removes pods from the Service without restarting them. If the store returns empty, restore its backup; restarting all replicas initializes fresh state. Mail remains in Stalwart.
+
+#### Branding
+
+`webmail.branding` sets Bulwark's logos, icons, colours and login page. Logo, icon and background settings take an https URL or a path on the webmail host. Files in `branding.files` (text, such as SVG) and `branding.binaryFiles` (base64, such as PNG) are served at `/branding/custom/<name>`; changing them restarts the webmail pods. `branding.existingConfigMap` mounts your own ConfigMap there instead; restart the pods after changing it.
+
+```yaml
+webmail:
+  appName: Example Mail
+  branding:
+    files:
+      logo.svg: |
+        <svg xmlns="http://www.w3.org/2000/svg" ...>...</svg>
+    favicon: /branding/custom/logo.svg
+    themeColor: "#571efa"
+    appLogo:
+      light: /branding/custom/logo.svg
+    login:
+      logo:
+        light: /branding/custom/logo.svg
+        maxHeight: 96px
+      layout: split
+      background:
+        light: https://cdn.example.org/login.jpg
+        dim: 30
+      companyName: Example
+      imprintUrl: https://example.org/imprint
+    palette:
+      light: {primary: "#571efa", primary-foreground: "#ffffff"}
+      dark: {primary: "#9b7bff", primary-foreground: "#0b0620"}
+```
+
+Bulwark applies a palette per hostname, so the chart sets `branding.palette` for the webmail's own hostnames: those of the HTTPRoute, else the Ingress host or `webmail.<domain>`. `branding.domains` sets [per-host branding](https://github.com/bulwarkmail/webmail/blob/main/.env.example) (`DOMAIN_BRANDING`) for other hostnames, or different names and logos per host; an exact entry for a webmail hostname replaces the palette there, and the most specific matching wildcard entry (`*.example.org`) is merged into the palette entry, so its names and logos still apply on the webmail host; its own palette colours win. A theme a user picks, or the default theme set in Bulwark's admin dashboard, overrides the palette. Settings changed in the admin dashboard (Admin > Branding) take precedence over these values.
 
 #### Moving an existing installation onto a store
 
@@ -693,6 +748,11 @@ Bitnami Common is vendored in `charts/` and updated by Renovate together with `C
 | encryption.blobKey.fileStorage | bool | `true` | Encrypts new file storage (WebDAV) blobs with the key. false stops encrypting them. |
 | encryption.blobKey.secretKey | string | `"key"` | Key in existingSecret that holds the key. |
 | encryption.provision | bool | `false` | Reapplies atRestEnable on every install/upgrade. Requires provisioning credentials. |
+| enterprise.apiKey.existingSecret | string | `""` |  |
+| enterprise.apiKey.secretKey | string | `"api-key"` | Key in existingSecret that holds the API key. |
+| enterprise.licenseKey.existingSecret | string | `""` |  |
+| enterprise.licenseKey.secretKey | string | `"license-key"` | Key in existingSecret that holds the license key. |
+| enterprise.logo | string | `""` | Default logo of Stalwart's web interface (Enterprise only): a data URI (data:image/svg+xml;base64,...), a base64-encoded image, or an http(s) URL, at most 1 MiB. Domains and tenants can override it in the WebUI. |
 | existingSecret | string | `""` | Existing Secret containing environment variables; also accepts STALWART_RECOVERY_ADMIN. |
 | extraEnv | object | `{}` | Extra environment variables injected into the container, for non-sensitive settings. Overrides chart-generated values; extraEnvVars takes precedence. |
 | extraEnvVars | list | `[]` | Extra environment variables as Kubernetes `env` entries (for example `valueFrom.secretKeyRef`). Overrides extraEnv and chart-generated values. Names must be unique; list order is preserved. |
@@ -892,6 +952,32 @@ Bitnami Common is vendored in `charts/` and updated by Renovate together with `C
 | webmail.autoscaling.minReplicas | int | `1` |  |
 | webmail.autoscaling.targetCPUUtilizationPercentage | int | `80` |  |
 | webmail.autoscaling.targetMemoryUtilizationPercentage | string | `""` |  |
+| webmail.branding.appLogo.dark | string | `""` |  |
+| webmail.branding.appLogo.light | string | `""` |  |
+| webmail.branding.backgroundColor | string | `""` | Splash screen colour of the installed app. |
+| webmail.branding.binaryFiles | object | `{}` | Binary files (PNG, JPEG, ICO) served at /branding/custom/<name>, base64-encoded. |
+| webmail.branding.domains | list | `[]` | Branding per hostname (Bulwark's DOMAIN_BRANDING), for other hostnames or different values, e.g. [{host: mail.example.org, loginCompanyName: Example, palette: {light: {primary: "#0b3d91"}}}]. An exact entry for a webmail hostname replaces the palette entry above; a matching wildcard entry (*.example.org) is merged into it, its own palette colours winning. |
+| webmail.branding.existingConfigMap | string | `""` | Existing ConfigMap whose keys are served at /branding/custom/<key>, instead of files/binaryFiles. Restart the webmail pods after changing it. |
+| webmail.branding.favicon | string | `""` | Browser tab icon, e.g. /branding/custom/favicon.svg. |
+| webmail.branding.files | object | `{}` | Text files served at /branding/custom/<name>, e.g. an SVG logo: {logo.svg: "<svg ...>"}. Changes restart the webmail pods. |
+| webmail.branding.login.background.blur | string | `""` | Blurs the picture, in px (0 to 24). |
+| webmail.branding.login.background.dark | string | `""` |  |
+| webmail.branding.login.background.dim | string | `""` | Dims the picture, in percent (0 to 80). |
+| webmail.branding.login.background.light | string | `""` |  |
+| webmail.branding.login.companyName | string | `""` | Shown above the version number. |
+| webmail.branding.login.imprintUrl | string | `""` |  |
+| webmail.branding.login.layout | string | `""` | centered (form in a card) or split (form in a side panel). Empty is centered. |
+| webmail.branding.login.logo.dark | string | `""` |  |
+| webmail.branding.login.logo.light | string | `""` |  |
+| webmail.branding.login.logo.maxHeight | string | `""` | Caps the rendered size, as a CSS length (e.g. 96px). |
+| webmail.branding.login.logo.maxWidth | string | `""` |  |
+| webmail.branding.login.privacyPolicyUrl | string | `""` |  |
+| webmail.branding.login.websiteUrl | string | `""` |  |
+| webmail.branding.palette.dark | object | `{}` |  |
+| webmail.branding.palette.light | object | `{}` |  |
+| webmail.branding.pwaIcon | string | `""` | Source image of the installed app's icons. Defaults to favicon. |
+| webmail.branding.shortName | string | `""` | Short name, e.g. the home screen label of the installed app. Defaults to appName. |
+| webmail.branding.themeColor | string | `""` | Browser UI colour of the installed app, e.g. #571efa. |
 | webmail.containerSecurityContext.allowPrivilegeEscalation | bool | `false` |  |
 | webmail.containerSecurityContext.capabilities.drop[0] | string | `"ALL"` |  |
 | webmail.containerSecurityContext.enabled | bool | `true` |  |

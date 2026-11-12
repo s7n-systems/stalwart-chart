@@ -56,6 +56,10 @@ encryption:
   provision: true
   blobKey:
     existingSecret: "stalwart-blob-key"
+enterprise:
+  apiKey:
+    existingSecret: "stalwart-enterprise"
+  logo: "https://example.org/logo.svg"
 oidc:
   enabled: true
   activate: false
@@ -73,6 +77,16 @@ webmail:
   enabled: true
   jmapServerUrl: "https://mail.example.org"
   logFormat: "json"
+  branding:
+    files:
+      logo.svg: "<svg xmlns=\"http://www.w3.org/2000/svg\"/>"
+    favicon: "/branding/custom/logo.svg"
+    login:
+      logo:
+        light: "/branding/custom/logo.svg"
+    palette:
+      light:
+        primary: "#571efa"
   oauth:
     enabled: true
     clientId: "bulwark"

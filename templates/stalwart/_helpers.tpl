@@ -147,8 +147,11 @@ maxUnavailable: {{ .maxUnavailable }}
 {{- if and (eq .Values.blobStore.backend "s3") (not .Values.blobStore.s3.existingSecret) (or (not .Values.blobStore.s3.accessKeyId) (not .Values.blobStore.s3.secretKey)) -}}
 {{- fail "blobStore.s3 requires existingSecret, or both accessKeyId and secretKey" -}}
 {{- end -}}
+{{- if and .Values.enterprise.apiKey.existingSecret .Values.enterprise.licenseKey.existingSecret -}}
+{{- fail "enterprise.apiKey and enterprise.licenseKey are exclusive: with the API key Stalwart renews and stores the license itself, which a fixed licenseKey would overwrite on every upgrade" -}}
+{{- end -}}
 {{- if and (eq (include "stalwart.cliCredentialsNeeded" .) "true") (not .Values.provisioning.existingSecret) (not .Values.provisioning.password) -}}
-{{- fail "provisioning.existingSecret or provisioning.password is required when S3 blob-store, metrics, encryption, blob compression, OIDC or extra provisioning, console logging, or certificateReload is enabled" -}}
+{{- fail "provisioning.existingSecret or provisioning.password is required when S3 blob-store, metrics, encryption, blob compression, enterprise, OIDC or extra provisioning, console logging, or certificateReload is enabled" -}}
 {{- end -}}
 {{- if and (eq .Values.coordinator.type "nats") (not .Values.coordinator.nats.hosts) -}}
 {{- fail "coordinator.nats.hosts is required when coordinator.type=nats" -}}
@@ -256,6 +259,26 @@ Helm chart blob key
 {{- $lines = append $lines (dict "@type" "update" "object" "FileStorage" "value" (dict "compressionAlgorithm" .) | toJson) -}}
 {{- end -}}
 {{- join "\n" $lines -}}
+{{- end -}}
+
+{{/* Enterprise edition settings (they need a license). The keys reach Stalwart through the
+     environment, never the plan; only the values that are set are written, so a license that
+     Stalwart renewed from its API key is not overwritten. */}}
+{{- define "stalwart.enterprisePlan" -}}
+{{- $e := .Values.enterprise -}}
+{{- $value := dict -}}
+{{- if $e.licenseKey.existingSecret -}}
+{{- $_ := set $value "licenseKey" (dict "@type" "EnvironmentVariable" "variableName" "STALWART_LICENSE_KEY") -}}
+{{- end -}}
+{{- if $e.apiKey.existingSecret -}}
+{{- $_ := set $value "apiKey" (dict "@type" "EnvironmentVariable" "variableName" "STALWART_ENTERPRISE_API_KEY") -}}
+{{- end -}}
+{{- with $e.logo -}}
+{{- $_ := set $value "logo" . -}}
+{{- end -}}
+{{- if $value -}}
+{{- dict "@type" "update" "object" "Enterprise" "value" $value | toJson -}}
+{{- end -}}
 {{- end -}}
 
 {{/* Stalwart serializes Set<T> fields as objects of value->true (e.g.
@@ -414,7 +437,7 @@ Helm chart blob key
 
 {{/* True when the CLI apply Job has at least one plan line to run. */}}
 {{- define "stalwart.provisioningEnabled" -}}
-{{- if or (eq .Values.blobStore.backend "s3") (and .Values.metrics.enabled .Values.metrics.provision) .Values.encryption.provision .Values.encryption.blobKey.existingSecret .Values.blobStore.compression .Values.oidc.enabled .Values.inMemoryStore.type .Values.coordinator.type .Values.systemAccounts.accounts .Values.provisioning.extraPlan .Values.logging.console.enabled .Values.hostname -}}
+{{- if or (eq .Values.blobStore.backend "s3") (and .Values.metrics.enabled .Values.metrics.provision) .Values.encryption.provision .Values.encryption.blobKey.existingSecret .Values.blobStore.compression (include "stalwart.enterprisePlan" .) .Values.oidc.enabled .Values.inMemoryStore.type .Values.coordinator.type .Values.systemAccounts.accounts .Values.provisioning.extraPlan .Values.logging.console.enabled .Values.hostname -}}
 true
 {{- end -}}
 {{- end -}}
@@ -452,6 +475,9 @@ true
 {{- end -}}
 {{- with include "stalwart.blobPlan" . -}}
 {{- $lines = concat $lines (splitList "\n" .) -}}
+{{- end -}}
+{{- with include "stalwart.enterprisePlan" . -}}
+{{- $lines = append $lines . -}}
 {{- end -}}
 {{- if .Values.inMemoryStore.type -}}
 {{- $lines = append $lines (dict "@type" "update" "object" "InMemoryStore" "value" (dict "@type" "Redis" "url" .Values.inMemoryStore.redis.url) | toJson) -}}

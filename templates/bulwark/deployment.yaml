@@ -28,10 +28,14 @@ spec:
       labels:
         {{- include "common.labels.standard" (dict "customLabels" (merge (dict "app.kubernetes.io/component" "webmail") (merge (omit .Values.webmail.podLabels "app.kubernetes.io/name" "app.kubernetes.io/instance" "app.kubernetes.io/component") (omit .Values.webmail.additionalLabels "app.kubernetes.io/name" "app.kubernetes.io/instance" "app.kubernetes.io/component"))) "context" .) | nindent 8 }}
       annotations:
-        {{- with (omit .Values.webmail.podAnnotations "checksum/secret") }}
+        {{- with (omit .Values.webmail.podAnnotations "checksum/secret" "checksum/branding") }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
         checksum/secret: {{ include (print $.Template.BasePath "/bulwark/secret.yaml") . | sha256sum }}
+        {{- if and (include "stalwart.webmailBrandingConfigMap" .) (not .Values.webmail.branding.existingConfigMap) }}
+        # Bulwark only serves the branding files that exist when it starts.
+        checksum/branding: {{ include (print $.Template.BasePath "/bulwark/branding-configmap.yaml") . | sha256sum }}
+        {{- end }}
     spec:
       serviceAccountName: {{ include "stalwart.webmailServiceAccountName" . }}
       automountServiceAccountToken: {{ .Values.webmail.serviceAccount.automountServiceAccountToken }}
@@ -98,6 +102,11 @@ spec:
               mountPath: /tmp
             - name: next-cache
               mountPath: /app/.next/cache
+            {{- if include "stalwart.webmailBrandingConfigMap" . }}
+            - name: branding
+              mountPath: /app/public/branding/custom
+              readOnly: true
+            {{- end }}
             {{- with .Values.webmail.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -109,6 +118,11 @@ spec:
         # Next.js writes its image and fetch cache here; the root filesystem is read-only.
         - name: next-cache
           emptyDir: {}
+        {{- with include "stalwart.webmailBrandingConfigMap" . }}
+        - name: branding
+          configMap:
+            name: {{ . | quote }}
+        {{- end }}
         {{- if .Values.webmail.persistence.enabled }}
         - name: data
           persistentVolumeClaim:

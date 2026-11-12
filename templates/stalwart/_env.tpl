@@ -14,6 +14,20 @@
       name: {{ . | quote }}
       key: {{ $.Values.encryption.blobKey.secretKey | quote }}
 {{- end }}
+{{- with .Values.enterprise.licenseKey.existingSecret }}
+- name: STALWART_LICENSE_KEY
+  valueFrom:
+    secretKeyRef:
+      name: {{ . | quote }}
+      key: {{ $.Values.enterprise.licenseKey.secretKey | quote }}
+{{- end }}
+{{- with .Values.enterprise.apiKey.existingSecret }}
+- name: STALWART_ENTERPRISE_API_KEY
+  valueFrom:
+    secretKeyRef:
+      name: {{ . | quote }}
+      key: {{ $.Values.enterprise.apiKey.secretKey | quote }}
+{{- end }}
 {{- if and .Values.metrics.enabled (or .Values.metrics.auth.existingSecret .Values.metrics.auth.password) }}
 - name: STALWART_METRICS_PASSWORD
   valueFrom:
