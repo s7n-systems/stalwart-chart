@@ -561,6 +561,31 @@ encryption:
     # -- Encrypts new file storage (WebDAV) blobs with the key. false stops encrypting them.
     fileStorage: true
 
+# Stalwart Enterprise edition: these settings need a paid Enterprise license from Stalwart Labs
+# (sponsors on OpenCollective get one too). Without a valid license Stalwart logs a warning and
+# runs as the community edition, ignoring them. Setting any of them requires provisioning
+# credentials. Clearing a value later leaves the stored setting in place; change it in the WebUI.
+# Stalwart reads the keys only at startup: after changing a Secret, restart the StatefulSet
+# (kubectl rollout restart statefulset/<fullname>).
+enterprise:
+  # Licensing by API key (recommended): Stalwart downloads the license for its hostname, renews
+  # it before it expires and stores it itself. Do not combine with licenseKey.
+  apiKey:
+    existingSecret: ""
+    # -- Key in existingSecret that holds the API key.
+    secretKey: "api-key"
+  # A fixed license key, e.g. for a server without internet access; replace the Secret before
+  # the license expires, then restart the StatefulSet. The license is bound to the server's
+  # hostname (`hostname`).
+  licenseKey:
+    existingSecret: ""
+    # -- Key in existingSecret that holds the license key.
+    secretKey: "license-key"
+  # -- Default logo of Stalwart's web interface (Enterprise only): a data URI
+  # (data:image/svg+xml;base64,...), a base64-encoded image, or an http(s) URL, at most 1 MiB.
+  # Domains and tenants can override it in the WebUI.
+  logo: ""
+
 # Delegates authentication to a third-party OpenID Connect provider
 # (e.g. Keycloak). This is a resource-server integration: Stalwart
 # validates bearer tokens against the provider's discovery document
@@ -711,6 +736,70 @@ webmail:
   # Service (plain HTTP); set the public URL for access from outside the cluster.
   jmapServerUrl: ""
   appName: ""
+
+  # Logos, icons, colours and the login page. Logo, icon and background settings take an
+  # https URL or a path on the webmail host: files from files/binaryFiles/existingConfigMap are
+  # served at /branding/custom/<name>. Settings changed in Bulwark's admin dashboard
+  # (Admin > Branding) take precedence over these. Empty values keep Bulwark's defaults.
+  branding:
+    # -- Text files served at /branding/custom/<name>, e.g. an SVG logo:
+    # {logo.svg: "<svg ...>"}. Changes restart the webmail pods.
+    files: {}
+    # -- Binary files (PNG, JPEG, ICO) served at /branding/custom/<name>, base64-encoded.
+    binaryFiles: {}
+    # -- Existing ConfigMap whose keys are served at /branding/custom/<key>, instead of
+    # files/binaryFiles. Restart the webmail pods after changing it.
+    existingConfigMap: ""
+    # -- Short name, e.g. the home screen label of the installed app. Defaults to appName.
+    shortName: ""
+    # -- Browser tab icon, e.g. /branding/custom/favicon.svg.
+    favicon: ""
+    # -- Source image of the installed app's icons. Defaults to favicon.
+    pwaIcon: ""
+    # -- Browser UI colour of the installed app, e.g. #571efa.
+    themeColor: ""
+    # -- Splash screen colour of the installed app.
+    backgroundColor: ""
+    # Logo in the sidebar after login. Empty shows none.
+    appLogo:
+      light: ""
+      dark: ""
+    login:
+      # Logo on the login page; dark falls back to Bulwark's logo, not to light.
+      logo:
+        light: ""
+        dark: ""
+        # -- Caps the rendered size, as a CSS length (e.g. 96px).
+        maxHeight: ""
+        maxWidth: ""
+      # -- centered (form in a card) or split (form in a side panel). Empty is centered.
+      layout: ""
+      # Background picture; dark falls back to light.
+      background:
+        light: ""
+        dark: ""
+        # -- Dims the picture, in percent (0 to 80).
+        dim: ""
+        # -- Blurs the picture, in px (0 to 24).
+        blur: ""
+      # -- Shown above the version number.
+      companyName: ""
+      websiteUrl: ""
+      imprintUrl: ""
+      privacyPolicyUrl: ""
+    # Colours of Bulwark's built-in look, as hex colours: primary, primary-foreground, accent
+    # and accent-foreground for each mode. Applied to the webmail's own hostnames (the
+    # HTTPRoute's hostnames, else the Ingress host or webmail.<domain>). A theme a user picks,
+    # or the default theme set in the admin dashboard, still overrides them.
+    palette:
+      light: {}
+      dark: {}
+    # -- Branding per hostname (Bulwark's DOMAIN_BRANDING), for other hostnames or
+    # different values, e.g. [{host: mail.example.org, loginCompanyName: Example,
+    # palette: {light: {primary: "#0b3d91"}}}]. An exact entry for a webmail hostname replaces
+    # the palette entry above; a matching wildcard entry (*.example.org) is merged into it, its
+    # own palette colours winning.
+    domains: []
   # -- Enables Stalwart-specific WebUI features (password change, Sieve
   # management, vacation responder, account security, API keys, admin
   # dashboard). Matches Bulwark's own default.

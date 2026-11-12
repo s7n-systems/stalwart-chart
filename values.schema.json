@@ -1207,6 +1207,41 @@
         }
       }
     },
+    "enterprise": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "apiKey": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "existingSecret": {
+              "type": "string"
+            },
+            "secretKey": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "licenseKey": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "existingSecret": {
+              "type": "string"
+            },
+            "secretKey": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "logo": {
+          "type": "string"
+        }
+      }
+    },
     "oidc": {
       "type": "object",
       "additionalProperties": false,
@@ -1370,6 +1405,219 @@
         },
         "appName": {
           "type": "string"
+        },
+        "branding": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "files": {
+              "type": "object",
+              "propertyNames": {
+                "pattern": "^[A-Za-z0-9._-]+$"
+              },
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "binaryFiles": {
+              "type": "object",
+              "propertyNames": {
+                "pattern": "^[A-Za-z0-9._-]+$"
+              },
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "existingConfigMap": {
+              "type": "string"
+            },
+            "shortName": {
+              "type": "string"
+            },
+            "favicon": {
+              "type": "string",
+              "pattern": "^(https?://\\S+|/[^/\\\\\\s]\\S*)?$"
+            },
+            "pwaIcon": {
+              "type": "string",
+              "pattern": "^(https?://\\S+|/[^/\\\\\\s]\\S*)?$"
+            },
+            "themeColor": {
+              "type": "string",
+              "pattern": "^(#[0-9A-Fa-f]{3,8})?$"
+            },
+            "backgroundColor": {
+              "type": "string",
+              "pattern": "^(#[0-9A-Fa-f]{3,8})?$"
+            },
+            "appLogo": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "light": {
+                  "type": "string",
+                  "pattern": "^(https?://\\S+|/[^/\\\\\\s]\\S*)?$"
+                },
+                "dark": {
+                  "type": "string",
+                  "pattern": "^(https?://\\S+|/[^/\\\\\\s]\\S*)?$"
+                }
+              }
+            },
+            "login": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "logo": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "light": {
+                      "type": "string",
+                      "pattern": "^(https?://\\S+|/[^/\\\\\\s]\\S*)?$"
+                    },
+                    "dark": {
+                      "type": "string",
+                      "pattern": "^(https?://\\S+|/[^/\\\\\\s]\\S*)?$"
+                    },
+                    "maxHeight": {
+                      "type": "string"
+                    },
+                    "maxWidth": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "layout": {
+                  "enum": [
+                    "",
+                    "centered",
+                    "split"
+                  ]
+                },
+                "background": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "light": {
+                      "type": "string",
+                      "pattern": "^(https?://\\S+|/[^/\\\\\\s]\\S*)?$"
+                    },
+                    "dark": {
+                      "type": "string",
+                      "pattern": "^(https?://\\S+|/[^/\\\\\\s]\\S*)?$"
+                    },
+                    "dim": {
+                      "anyOf": [
+                        {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 80
+                        },
+                        {
+                          "type": "string",
+                          "pattern": "^([0-9]+)?$"
+                        }
+                      ]
+                    },
+                    "blur": {
+                      "anyOf": [
+                        {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 24
+                        },
+                        {
+                          "type": "string",
+                          "pattern": "^([0-9]+)?$"
+                        }
+                      ]
+                    }
+                  }
+                },
+                "companyName": {
+                  "type": "string"
+                },
+                "websiteUrl": {
+                  "type": "string",
+                  "pattern": "^(https?://\\S+|/[^/\\\\\\s]\\S*)?$"
+                },
+                "imprintUrl": {
+                  "type": "string",
+                  "pattern": "^(https?://\\S+|/[^/\\\\\\s]\\S*)?$"
+                },
+                "privacyPolicyUrl": {
+                  "type": "string",
+                  "pattern": "^(https?://\\S+|/[^/\\\\\\s]\\S*)?$"
+                }
+              }
+            },
+            "palette": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "light": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "primary": {
+                      "type": "string",
+                      "pattern": "^#[0-9A-Fa-f]{3,8}$"
+                    },
+                    "primary-foreground": {
+                      "type": "string",
+                      "pattern": "^#[0-9A-Fa-f]{3,8}$"
+                    },
+                    "accent": {
+                      "type": "string",
+                      "pattern": "^#[0-9A-Fa-f]{3,8}$"
+                    },
+                    "accent-foreground": {
+                      "type": "string",
+                      "pattern": "^#[0-9A-Fa-f]{3,8}$"
+                    }
+                  }
+                },
+                "dark": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "primary": {
+                      "type": "string",
+                      "pattern": "^#[0-9A-Fa-f]{3,8}$"
+                    },
+                    "primary-foreground": {
+                      "type": "string",
+                      "pattern": "^#[0-9A-Fa-f]{3,8}$"
+                    },
+                    "accent": {
+                      "type": "string",
+                      "pattern": "^#[0-9A-Fa-f]{3,8}$"
+                    },
+                    "accent-foreground": {
+                      "type": "string",
+                      "pattern": "^#[0-9A-Fa-f]{3,8}$"
+                    }
+                  }
+                }
+              }
+            },
+            "domains": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "host"
+                ],
+                "properties": {
+                  "host": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              }
+            }
+          }
         },
         "stalwartFeatures": {
           "type": "boolean"
