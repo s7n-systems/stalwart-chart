@@ -34,6 +34,41 @@ app.kubernetes.io/component: server
 {{- end -}}
 {{- end -}}
 
+{{/* Secret with the certificate mounted at /etc/stalwart/tls. */}}
+{{- define "stalwart.tlsSecretName" -}}
+{{- .Values.tls.secretName | default (printf "%s-tls" (include "stalwart.fullname" .)) -}}
+{{- end -}}
+
+{{/* The certificate reload CronJob runs when asked for, and always with tls.enabled. */}}
+{{- define "stalwart.certificateReloadEnabled" -}}
+{{- if or .Values.certificateReload.enabled .Values.tls.enabled -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/* The `helm test` pod, allowed in wherever a NetworkPolicy restricts sources. */}}
+{{- define "stalwart.testPeer" -}}
+{{- if .Values.tests.enabled -}}
+- podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name | quote }}
+      app.kubernetes.io/component: test
+{{- end -}}
+{{- end -}}
+
+{{/* "https" when an Ingress tls entry covers .host (exactly or by a *.wildcard), else "http". */}}
+{{- define "stalwart.ingressScheme" -}}
+{{- $scheme := "http" -}}
+{{- range .tls -}}
+{{- range .hosts -}}
+{{- if or (eq . $.host) (and (hasPrefix "*." .) (hasSuffix (trimPrefix "*" .) $.host) (not (contains "." (trimSuffix (trimPrefix "*" .) $.host)))) -}}
+{{- $scheme = "https" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $scheme -}}
+{{- end -}}
+
 {{- define "stalwart.managementPort" -}}
 {{- if .Values.recoveryMode.enabled -}}
 {{- .Values.recoveryMode.port -}}
@@ -151,7 +186,7 @@ maxUnavailable: {{ .maxUnavailable }}
 {{- fail "enterprise.apiKey and enterprise.licenseKey are exclusive: with the API key Stalwart renews and stores the license itself, which a fixed licenseKey would overwrite on every upgrade" -}}
 {{- end -}}
 {{- if and (eq (include "stalwart.cliCredentialsNeeded" .) "true") (not .Values.provisioning.existingSecret) (not .Values.provisioning.password) -}}
-{{- fail "provisioning.existingSecret or provisioning.password is required when S3 blob-store, metrics, encryption, blob compression, enterprise, OIDC or extra provisioning, console logging, or certificateReload is enabled" -}}
+{{- fail "provisioning.existingSecret or provisioning.password is required when S3 blob-store, metrics, encryption, blob compression, enterprise, OIDC or extra provisioning, console logging, certificateReload or tls is enabled" -}}
 {{- end -}}
 {{- if and (eq .Values.coordinator.type "nats") (not .Values.coordinator.nats.hosts) -}}
 {{- fail "coordinator.nats.hosts is required when coordinator.type=nats" -}}
@@ -173,6 +208,15 @@ maxUnavailable: {{ .maxUnavailable }}
 {{- end -}}
 {{- if and .Values.hostname (not (.Values.mailDomain | default .Values.domain)) -}}
 {{- fail "hostname requires mailDomain (or domain): Stalwart needs a default domain with the hostname" -}}
+{{- end -}}
+{{- if and .Values.tls.enabled (not .Values.hostname) -}}
+{{- fail "tls.enabled requires hostname: Stalwart only accepts a default certificate together with its default hostname" -}}
+{{- end -}}
+{{- if and .Values.tls.certManager.enabled (not .Values.tls.enabled) -}}
+{{- fail "tls.certManager.enabled requires tls.enabled" -}}
+{{- end -}}
+{{- if and .Values.tls.certManager.enabled (not .Values.tls.certManager.issuerRef.name) -}}
+{{- fail "tls.certManager.issuerRef.name is required: name the cert-manager Issuer or ClusterIssuer to request the certificate from" -}}
 {{- end -}}
 {{- if and .Values.oidc.activate (not .Values.oidc.enabled) -}}
 {{- fail "oidc.activate requires oidc.enabled" -}}
@@ -437,7 +481,7 @@ Helm chart blob key
 
 {{/* True when the CLI apply Job has at least one plan line to run. */}}
 {{- define "stalwart.provisioningEnabled" -}}
-{{- if or (eq .Values.blobStore.backend "s3") (and .Values.metrics.enabled .Values.metrics.provision) .Values.encryption.provision .Values.encryption.blobKey.existingSecret .Values.blobStore.compression (include "stalwart.enterprisePlan" .) .Values.oidc.enabled .Values.inMemoryStore.type .Values.coordinator.type .Values.systemAccounts.accounts .Values.provisioning.extraPlan .Values.logging.console.enabled .Values.hostname -}}
+{{- if or (eq .Values.blobStore.backend "s3") (and .Values.metrics.enabled .Values.metrics.provision) .Values.encryption.provision .Values.encryption.blobKey.existingSecret .Values.blobStore.compression (include "stalwart.enterprisePlan" .) .Values.oidc.enabled .Values.inMemoryStore.type .Values.coordinator.type .Values.systemAccounts.accounts .Values.provisioning.extraPlan .Values.logging.console.enabled .Values.hostname .Values.tls.enabled -}}
 true
 {{- end -}}
 {{- end -}}
@@ -455,7 +499,7 @@ true
 {{/* True when a stalwart-cli workload (provisioning Job or certificate reload CronJob)
      needs the provisioning credentials. */}}
 {{- define "stalwart.cliCredentialsNeeded" -}}
-{{- if or (eq (include "stalwart.provisioningEnabled" .) "true") .Values.certificateReload.enabled -}}
+{{- if or (eq (include "stalwart.provisioningEnabled" .) "true") (include "stalwart.certificateReloadEnabled" .) -}}
 true
 {{- end -}}
 {{- end -}}
@@ -498,7 +542,16 @@ true
 {{/* Stalwart requires a default domain with the hostname; the domain is matched by name, so an
      existing one is reused. */}}
 {{- $lines = append $lines (dict "@type" "upsert" "object" "Domain" "matchOn" (list "name") "value" (dict "default-domain" (dict "name" (.Values.mailDomain | default .Values.domain))) | toJson) -}}
-{{- $lines = append $lines (dict "@type" "update" "object" "SystemSettings" "value" (dict "defaultHostname" .Values.hostname "defaultDomainId" "#default-domain") | toJson) -}}
+{{- $settings := dict "defaultHostname" .Values.hostname "defaultDomainId" "#default-domain" -}}
+{{- if .Values.tls.enabled -}}
+{{/* Matched by its certificate source, the file path, so an upgrade updates the same object.
+     Stalwart reads the names from the file. It only accepts defaultCertificateId in the same
+     update as the hostname and domain on a new server. */}}
+{{- $files := dict "certificate" (dict "@type" "File" "filePath" "/etc/stalwart/tls/tls.crt") "privateKey" (dict "@type" "File" "filePath" "/etc/stalwart/tls/tls.key") -}}
+{{- $lines = append $lines (dict "@type" "upsert" "object" "Certificate" "matchOn" (list "certificate") "value" (dict "chart-tls" $files) | toJson) -}}
+{{- $_ := set $settings "defaultCertificateId" "#chart-tls" -}}
+{{- end -}}
+{{- $lines = append $lines (dict "@type" "update" "object" "SystemSettings" "value" $settings | toJson) -}}
 {{- end -}}
 {{- range .Values.provisioning.extraPlan -}}
 {{- $lines = append $lines (toJson .) -}}

@@ -11,4 +11,7 @@ logging:
 persistence:
   enabled: true
   size: "10Gi"
+  retentionPolicy:
+    whenDeleted: "Retain"
+    whenScaled: "Delete"
 ...

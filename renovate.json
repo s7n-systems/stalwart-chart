@@ -51,6 +51,17 @@
       "datasourceTemplate": "docker"
     },
     {
+      "description": "Artifact Hub image list in Chart.yaml; same depName as the values.yaml pin, so both move in one PR.",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^Chart\\.yaml$/"
+      ],
+      "matchStrings": [
+        "image: \"(?<depName>[a-z0-9.-]+/[a-z0-9._/-]+):(?<currentValue>[A-Za-z0-9._-]+)@(?<currentDigest>sha256:[a-f0-9]{64})\""
+      ],
+      "datasourceTemplate": "docker"
+    },
+    {
       "description": "Helm version used by the workflows.",
       "customType": "regex",
       "managerFilePatterns": [

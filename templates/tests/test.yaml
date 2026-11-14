@@ -1,0 +1,64 @@
+{{- if .Values.tests.enabled }}
+{{- $fullname := include "stalwart.fullname" . }}
+{{- $checks := list (dict "name" "management" "type" "http" "url" (printf "http://%s-management.%s.svc:%v/healthz/ready" $fullname .Release.Namespace .Values.management.servicePort)) }}
+{{- if and .Values.service.enabled (not .Values.recoveryMode.enabled) }}
+{{/* Port name -> [TLS, greeting]. Other names, and plain http, only need to connect. */}}
+{{- $protocols := dict "smtp" (list false "220") "submission" (list false "220") "smtps" (list true "220") "imap" (list false "* OK") "imaps" (list true "* OK") "pop3" (list false "+OK") "pop3s" (list true "+OK") "sieve" (list false "\"") "https" (list true "") }}
+{{- range $name, $port := .Values.service.ports }}
+{{- if and $port (eq ($port.protocol | default "TCP") "TCP") }}
+{{- $protocol := get $protocols $name | default (list false "") }}
+{{- $checks = append $checks (dict "name" $name "type" "tcp" "host" (printf "%s.%s.svc" $fullname $.Release.Namespace) "port" $port.port "tls" (index $protocol 0) "greeting" (index $protocol 1) "sni" $.Values.hostname) }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if .Values.webmail.enabled }}
+{{- $checks = append $checks (dict "name" "webmail" "type" "http" "url" (printf "http://%s.%s.svc:%v/api/health" (include "stalwart.webmailFullname" .) .Release.Namespace .Values.webmail.service.port)) }}
+{{- end }}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ $fullname }}-test
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "common.labels.standard" (dict "customLabels" (dict "app.kubernetes.io/name" (printf "%s-test" (include "stalwart.name" .))) "context" .) | nindent 4 }}
+    app.kubernetes.io/component: test
+  annotations:
+    "helm.sh/hook": test
+    # A failed run stays for its logs until the next `helm test`.
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  {{- include "common.images.renderPullSecrets" (dict "images" (list .Values.provisioning.reconcile.image) "context" $) | nindent 2 }}
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    seccompProfile:
+      type: RuntimeDefault
+  {{- with .Values.nodeSelector }}
+  nodeSelector: {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.tolerations }}
+  tolerations: {{- toYaml . | nindent 4 }}
+  {{- end }}
+  containers:
+    - name: test
+      image: {{ include "common.images.image" (dict "imageRoot" .Values.provisioning.reconcile.image "global" .Values.global) | quote }}
+      imagePullPolicy: {{ .Values.provisioning.reconcile.image.pullPolicy }}
+      command: [python3, -I, -c]
+      args:
+        - {{ .Files.Get "files/helm-test.py" | quote }}
+      env:
+        - name: CHECKS
+          value: {{ toJson $checks | quote }}
+        - name: PYTHONDONTWRITEBYTECODE
+          value: "1"
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: [ALL]
+      resources:
+        {{- toYaml .Values.tests.resources | nindent 8 }}
+{{- end }}

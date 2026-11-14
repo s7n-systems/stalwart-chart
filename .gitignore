@@ -1,4 +1,7 @@
 .claude/
+.codex/
+.agents/
+.qwen/
 __pycache__/
 rendered/
 rendered-check/

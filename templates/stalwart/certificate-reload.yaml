@@ -1,4 +1,4 @@
-{{- if .Values.certificateReload.enabled }}
+{{- if include "stalwart.certificateReloadEnabled" . }}
 {{/* Stalwart reads certificate files only on startup or reload: a mounted
      Secret renewed by cert-manager is not picked up until ReloadTlsCertificates. */}}
 apiVersion: v1

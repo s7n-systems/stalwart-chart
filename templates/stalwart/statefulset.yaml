@@ -14,6 +14,9 @@ spec:
   updateStrategy: {{- toYaml .Values.updateStrategy | nindent 4 }}
   serviceName: {{ include "stalwart.fullname" . }}-headless
   podManagementPolicy: {{ .Values.podManagementPolicy }}
+  {{- with .Values.persistence.retentionPolicy }}
+  persistentVolumeClaimRetentionPolicy: {{- toYaml . | nindent 4 }}
+  {{- end }}
   {{- if not .Values.autoscaling.enabled }}
   replicas: {{ .Values.replicaCount }}
   {{- end }}
@@ -34,6 +37,9 @@ spec:
       serviceAccountName: {{ include "stalwart.serviceAccountName" . }}
       automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
       {{- include "common.images.renderPullSecrets" (dict "images" (list .Values.image) "context" $) | nindent 6 }}
       {{- if .Values.podSecurityContext.enabled }}
       securityContext:
@@ -127,11 +133,19 @@ spec:
               mountPath: /tmp
             - name: data
               mountPath: /var/lib/stalwart
+            {{- if .Values.tls.enabled }}
+            - name: tls
+              mountPath: /etc/stalwart/tls
+              readOnly: true
+            {{- end }}
             {{- with .Values.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+        {{- with .Values.sidecars }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
       volumes:
         - name: tmp
           emptyDir: {}
@@ -145,6 +159,12 @@ spec:
         - name: config
           configMap:
             name: {{ include "stalwart.fullname" . }}-config
+        {{- if .Values.tls.enabled }}
+        # Mounted as a directory, not by subPath, so renewed files appear without a restart.
+        - name: tls
+          secret:
+            secretName: {{ include "stalwart.tlsSecretName" . | quote }}
+        {{- end }}
   {{- if .Values.persistence.enabled }}
   volumeClaimTemplates:
     - metadata:

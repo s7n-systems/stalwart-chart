@@ -63,10 +63,10 @@ The chart deploys Stalwart 1.0 as a StatefulSet and configures it the way Stalwa
 | **Declarative settings** | Blob store, server hostname and default domain, Prometheus exporter, logging, OIDC directory, in-memory store, cluster coordinator, encryption at rest, blob encryption and compression, Enterprise license and logo applied by a CLI Job; anything else through `provisioning.extraPlan` |
 | **System accounts** | Send-only accounts for other applications, with app passwords published to Secrets |
 | **Exposure** | Mail Service for SMTP, IMAP, POP3 and ManageSieve (LoadBalancer or NodePort); Ingress or Gateway API HTTPRoute for the web UI, JMAP and DAV; Gateway API TCPRoutes for mail ports; dual-stack |
-| **Scaling** | HorizontalPodAutoscaler with a conservative scale-down, PodDisruptionBudget, anti-affinity presets, topology spread, NATS/Redis/Kafka/Zenoh coordination |
+| **Scaling** | HorizontalPodAutoscaler with a conservative scale-down, PodDisruptionBudget, anti-affinity presets, topology spread, priority classes, sidecars, NATS/Redis/Kafka/Zenoh coordination |
 | **Security** | Non-root, read-only root filesystem, all capabilities dropped except `NET_BIND_SERVICE`, no ServiceAccount token in the Stalwart and webmail pods, images pinned by digest, optional NetworkPolicies and Kyverno policies |
-| **Observability** | Prometheus exporter with optional Basic authentication and ServiceMonitor; logs to stdout |
-| **Certificates** | Mounted certificates (for example from cert-manager) reloaded on a schedule without restarting pods |
+| **Observability** | Prometheus exporter with optional Basic authentication and ServiceMonitor; logs to stdout; `helm test` checks every mail port |
+| **Certificates** | Default certificate from a Secret or a cert-manager Certificate, registered in Stalwart and reloaded on a schedule without restarting pods |
 | **Webmail** | Bulwark JMAP webmail with OAuth/OIDC login, branding (logos, colours, login page), its own autoscaling, PDB and persistence |
 | **Supply chain** | Chart published to GHCR as an OCI artifact and signed with cosign; Renovate keeps images, actions and tools current |
 
@@ -102,7 +102,7 @@ Copy the example to `my-values.yaml`, set the database host, bucket, `hostname` 
 
 ```sh
 helm upgrade --install stalwart oci://ghcr.io/s7n-systems/charts/stalwart \
-  --version 0.5.0 --namespace stalwart -f my-values.yaml --timeout 15m
+  --version 0.6.0 --namespace stalwart -f my-values.yaml --timeout 15m
 ```
 
 The chart validates required storage settings and credential references before rendering. It cannot check whether referenced Secrets exist or whether external services are reachable; these failures can still leave an incomplete installation. To install from a checkout instead, use `.` as the chart: Bitnami Common is vendored in `charts/`, so no dependency download is needed.
@@ -112,7 +112,7 @@ The chart validates required storage settings and credential references before r
 Release builds are signed keylessly with cosign 3 from this repository's release workflow. Cosign 3 stores the signature as an OCI referrer in the new bundle format; verify with cosign 3 or newer (cosign 2 reports "no signatures found"):
 
 ```sh
-cosign verify ghcr.io/s7n-systems/charts/stalwart:0.5.0 \
+cosign verify ghcr.io/s7n-systems/charts/stalwart:0.6.0 \
   --certificate-identity-regexp '^https://github\.com/s7n-systems/stalwart-chart/\.github/workflows/release\.yml@' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
@@ -122,7 +122,7 @@ cosign verify ghcr.io/s7n-systems/charts/stalwart:0.5.0 \
 For an interactive first-time setup, use recovery mode, which suspends mail services and opens only the management listener. You can instead provision domains and other settings through `provisioning.extraPlan` during a normal installation.
 
 ```sh
-helm upgrade --install stalwart oci://ghcr.io/s7n-systems/charts/stalwart --version 0.5.0 \
+helm upgrade --install stalwart oci://ghcr.io/s7n-systems/charts/stalwart --version 0.6.0 \
   --namespace stalwart -f my-values.yaml --set recoveryMode.enabled=true --timeout 15m
 kubectl --namespace stalwart port-forward svc/stalwart-management 8080:8080
 ```
@@ -286,34 +286,24 @@ Each `tcpRoutes` key names a `service.ports` entry and needs a TCP listener on t
 
 ### TLS certificates
 
-Stalwart can obtain certificates itself over ACME. To use certificates managed by cert-manager instead, mount the Secret, register it in Stalwart, and enable periodic certificate reloads:
+Stalwart can obtain certificates itself over ACME. To use a certificate from Kubernetes instead, set `tls`: the chart mounts the Secret at `/etc/stalwart/tls`, registers it in Stalwart and makes it the default certificate for all listeners. With `tls.certManager`, the chart also requests the certificate from cert-manager:
 
 ```yaml
-extraVolumes:
-  - name: tls
-    secret:
-      secretName: mail-example-org-tls
-extraVolumeMounts:
-  - name: tls
-    mountPath: /etc/stalwart/tls
-    readOnly: true
-
+hostname: mail.example.org
+domain: example.org                      # the default domain Stalwart needs with the hostname
 provisioning:
-  extraPlan:
-    - "@type": upsert
-      object: Certificate
-      matchOn: [certificate]
-      value:
-        main-tls:
-          certificate: {"@type": File, filePath: /etc/stalwart/tls/tls.crt}
-          privateKey: {"@type": File, filePath: /etc/stalwart/tls/tls.key}
-    - {"@type": update, object: SystemSettings, value: {defaultCertificateId: "#main-tls"}}
-
-certificateReload:
+  existingSecret: stalwart-admin         # key: password
+tls:
   enabled: true
+  certManager:
+    enabled: true
+    issuerRef: {name: letsencrypt, kind: ClusterIssuer}
+    dnsNames: [mail.example.org, imap.example.org]   # default: hostname
 ```
 
-Stalwart reads certificate files only at start-up or on `ReloadTlsCertificates`. `certificateReload` runs that action from a CronJob (daily by default, `certificateReload.schedule`) with the provisioning credentials, so renewed certificates are picked up at the next successful scheduled reload without a restart. It does not watch Secret changes.
+`tls` requires `hostname`, since Stalwart accepts a default certificate only together with the default hostname, and the provisioning credentials. Without `certManager`, the Secret in `tls.secretName` (default `<fullname>-tls`) must exist with `tls.crt` and `tls.key`, for example from a Certificate you manage yourself. The pods wait for it before they start. The certificate needs a DNS-01 issuer or an HTTP-01 solver that the Ingress controller or Gateway serves, because Stalwart has no listener on port 80.
+
+Stalwart reads certificate files only at start-up or on `ReloadTlsCertificates`. The `certificateReload` CronJob runs that action (daily by default, `certificateReload.schedule`) with the provisioning credentials, so renewed certificates are picked up at the next scheduled reload without a restart. It runs whenever `tls.enabled` is set; enable `certificateReload.enabled` yourself for certificates mounted another way. It does not watch Secret changes.
 
 ### Monitoring
 
@@ -501,9 +491,10 @@ The chart does not deploy the store. It holds admin config (including OAuth clie
 
 - persistence (for example, AOF on a persistent volume) and backups;
 - `maxmemory-policy noeviction`;
-- authentication and `rediss://` across untrusted networks.
+- a password: Bulwark refuses a store URL without one and answers every request with 503. Set `sharedStore.allowNoPassword: true` only if nothing but the webmail pods can reach the store;
+- `rediss://` across untrusted networks.
 
-Stalwart's `inMemoryStore` can share the same server if it meets these requirements. Set `sharedStore.keyPrefix` per release when sharing a store. While the store is unreachable, `/api/ready` removes pods from the Service without restarting them. If the store returns empty, restore its backup; restarting all replicas initializes fresh state. Mail remains in Stalwart.
+Stalwart's `inMemoryStore` can share the same server if it meets these requirements; its URL then needs the password too, which Stalwart stores in its database in clear text. Set `sharedStore.keyPrefix` per release when sharing a store. While the store is unreachable, `/api/ready` removes pods from the Service without restarting them. If the store returns empty, restore its backup; restarting all replicas initializes fresh state. Mail remains in Stalwart.
 
 #### Branding
 
@@ -598,6 +589,8 @@ NATS is recommended for most clusters (plain pub/sub, no JetStream); `redis`, `k
 | `pdb` | `maxUnavailable: 1` whenever more than one replica is possible, so node drains evict one pod at a time. Single replicas get no budget and never block drains. |
 | `podManagementPolicy` | `OrderedReady` starts pods one at a time. `Parallel` scales faster with an external database, but cannot be changed on an existing StatefulSet without recreating it. |
 | `podAntiAffinityPreset` | `soft` or `hard` spreads pods across nodes; `topologySpreadConstraints` spreads them across zones. |
+| `priorityClassName` | Empty. Set a PriorityClass so mail pods are scheduled, and kept, before less important workloads. |
+| `persistence.retentionPolicy` | Empty, which keeps the volumes when the StatefulSet is deleted or scaled down. `whenScaled: Delete` removes the volumes of removed replicas. |
 
 `role` and `pushShard` apply to every pod of a release; install several releases for different roles. Bulwark has its own `webmail.autoscaling` and `webmail.pdb`.
 
@@ -641,6 +634,8 @@ See [Upgrading](docs/upgrading.md) before changing application versions.
 - **Secrets:** pods read environment variables at start-up. Restart them after changing an existing Secret.
 - **Names:** keep the release name and `fullnameOverride` stable; volume claims are tied to them.
 - **Resources:** the default requests (100m CPU, 512 MiB) suit a small installation. There is no CPU limit, to avoid throttling mail processing.
+- **Sidecars:** `sidecars` and `webmail.sidecars` add containers as written, e.g. a log shipper. They must meet the same pod security settings as the chart's containers to pass the [Kyverno policies](policies/kyverno).
+- **Tests:** `helm test <release>` runs a pod that checks the management endpoint, then for each port in `service.ports` connects, completes the TLS handshake on implicit-TLS ports and reads the protocol greeting (by port name: `smtp`, `smtps`, `submission`, `imap`, `imaps`, `pop3`, `pop3s`, `sieve`, `https`; other names only connect), and the webmail's `/api/health`. It does not verify the certificate. Helm deletes the pod after a successful run; a failed one stays for `kubectl logs <fullname>-test` until the next run. Installs, upgrades and syncs never run it: only `helm test` or `helmfile test` do, and Argo CD skips test hooks entirely. Disable it with `tests.enabled: false`.
 
 ### Before production
 
@@ -668,7 +663,7 @@ This README is generated from `README.md.gotmpl` and the `# --` comments in `val
 
 ### Release
 
-Bitnami Common is vendored in `charts/` and updated by Renovate together with `Chart.lock`; for a manual update run `helm dependency update .` and commit both. Push a `vX.Y.Z` tag matching `version` in `Chart.yaml`: the release workflow runs CI, publishes the chart to `oci://ghcr.io/s7n-systems/charts/stalwart`, signs it with cosign and creates a GitHub release with the packaged chart and generated notes.
+Bitnami Common is vendored in `charts/` and updated by Renovate together with `Chart.lock`; for a manual update run `helm dependency update .` and commit both. Before a release, replace `artifacthub.io/changes` in `Chart.yaml` with the release's changes, and set `artifacthub.io/containsSecurityUpdates` accordingly; Renovate keeps `artifacthub.io/images` in step with `values.yaml`, and a test fails if they differ. Push a `vX.Y.Z` tag matching `version` in `Chart.yaml`: the release workflow runs CI, publishes the chart to `oci://ghcr.io/s7n-systems/charts/stalwart`, signs it with cosign and creates a GitHub release with the packaged chart and generated notes.
 
 ## Values
 
@@ -840,6 +835,7 @@ Bitnami Common is vendored in `charts/` and updated by Renovate together with `C
 | pdb.minAvailable | string | `""` | Pods that must stay available, as a number or percentage. Replaces maxUnavailable when set; a value equal to the replica count blocks drains. |
 | persistence.accessMode | string | `"ReadWriteOnce"` |  |
 | persistence.enabled | bool | `false` | Disabled for external PostgreSQL/S3; enable for local durable stores. |
+| persistence.retentionPolicy | object | `{}` | StatefulSet persistentVolumeClaimRetentionPolicy: whenDeleted and whenScaled, each Retain or Delete. Empty keeps Kubernetes' default, Retain for both. |
 | persistence.size | string | `"20Gi"` |  |
 | persistence.storageClass | string | `""` | Empty uses the cluster default; "-" explicitly requests no storage class. |
 | podAnnotations | object | `{}` | Extra annotations on the mail pods. `checksum/config` and `checksum/secret` are reserved. |
@@ -853,6 +849,7 @@ Bitnami Common is vendored in `charts/` and updated by Renovate together with `C
 | podSecurityContext.runAsNonRoot | bool | `true` |  |
 | podSecurityContext.runAsUser | int | `2000` |  |
 | podSecurityContext.seccompProfile.type | string | `"RuntimeDefault"` |  |
+| priorityClassName | string | `""` | PriorityClass for the mail pods, e.g. so they are scheduled before less important workloads. |
 | provisioning.activeDeadlineSeconds | int | `600` |  |
 | provisioning.backoffLimit | int | `6` |  |
 | provisioning.existingSecret | string | `""` | Password for an administrator already recognized by Stalwart. |
@@ -903,6 +900,7 @@ Bitnami Common is vendored in `charts/` and updated by Renovate together with `C
 | service.externalTrafficPolicy | string | `"Local"` | Preserve source IPs when supported by the load balancer. |
 | service.ipFamilies | list | `[]` |  |
 | service.ipFamilyPolicy | string | `""` | Dual-stack: SingleStack, PreferDualStack or RequireDualStack. Empty leaves the cluster default. ipFamilies (IPv4/IPv6, in order) with two entries requires a *DualStack policy. |
+| service.loadBalancerClass | string | `""` | Load balancer implementation for type LoadBalancer, e.g. service.k8s.aws/nlb. Empty uses the cluster default. Immutable once the Service exists. |
 | service.loadBalancerSourceRanges | list | `[]` |  |
 | service.ports.https.containerPort | int | `443` |  |
 | service.ports.https.port | int | `443` |  |
@@ -922,6 +920,7 @@ Bitnami Common is vendored in `charts/` and updated by Renovate together with `C
 | serviceAccount.create | bool | `true` |  |
 | serviceAccount.labels | object | `{}` |  |
 | serviceAccount.name | string | `""` |  |
+| sidecars | list | `[]` | Extra containers in the mail pod, as written (e.g. a log shipper). For sidecars that must start first, use extraInitContainers with restartPolicy: Always. |
 | startupProbe.enabled | bool | `true` |  |
 | startupProbe.failureThreshold | int | `60` |  |
 | startupProbe.initialDelaySeconds | int | `0` |  |
@@ -934,6 +933,20 @@ Bitnami Common is vendored in `charts/` and updated by Renovate together with `C
 | systemAccounts.smtpCheck.port | int | `587` |  |
 | systemAccounts.smtpCheck.startTls | bool | `false` |  |
 | terminationGracePeriodSeconds | int | `60` | Seconds the pod gets to shut down cleanly. Stalwart needs time to drain connections. |
+| tests.enabled | bool | `true` |  |
+| tests.resources.requests.cpu | string | `"10m"` |  |
+| tests.resources.requests.memory | string | `"32Mi"` |  |
+| tls.certManager.annotations | object | `{}` |  |
+| tls.certManager.dnsNames | list | `[]` | Names on the certificate. Empty uses hostname. Add the names mail clients use, e.g. imap.example.org, if they differ from hostname. |
+| tls.certManager.duration | string | `""` | Empty uses cert-manager's defaults (90 days, renewal after two thirds). |
+| tls.certManager.enabled | bool | `false` |  |
+| tls.certManager.issuerRef | object | `{"group":"cert-manager.io","kind":"ClusterIssuer","name":""}` | The Issuer or ClusterIssuer to request from; name is required. |
+| tls.certManager.privateKey.algorithm | string | `"ECDSA"` |  |
+| tls.certManager.privateKey.rotationPolicy | string | `"Always"` |  |
+| tls.certManager.privateKey.size | string | `nil` | Key size: empty uses 256 for ECDSA (256, 384 or 521) and 2048 for RSA (2048 to 8192); Ed25519 has none. |
+| tls.certManager.renewBefore | string | `""` |  |
+| tls.enabled | bool | `false` |  |
+| tls.secretName | string | `""` | Secret with tls.crt and tls.key. Empty uses <fullname>-tls. |
 | tolerations | list | `[]` | Tolerations for the mail StatefulSet. |
 | topologySpreadConstraints | list | `[]` | Topology spread constraints for the mail StatefulSet. Use for zone-level spreading; `podAntiAffinityPreset` only covers nodes. |
 | updateStrategy | object | `{"type":"RollingUpdate"}` | RollingUpdate without a partition whenever settings are provisioned: the reconcile Job applies them by a rolling restart and waits for every pod. |
@@ -1048,6 +1061,7 @@ Bitnami Common is vendored in `charts/` and updated by Renovate together with `C
 | webmail.podSecurityContext.runAsNonRoot | bool | `true` |  |
 | webmail.podSecurityContext.runAsUser | int | `1001` |  |
 | webmail.podSecurityContext.seccompProfile.type | string | `"RuntimeDefault"` |  |
+| webmail.priorityClassName | string | `""` | PriorityClass for the webmail pods. |
 | webmail.readinessProbe.enabled | bool | `true` |  |
 | webmail.readinessProbe.failureThreshold | int | `3` |  |
 | webmail.readinessProbe.initialDelaySeconds | int | `0` |  |
@@ -1060,6 +1074,7 @@ Bitnami Common is vendored in `charts/` and updated by Renovate together with `C
 | webmail.service.annotations | object | `{}` |  |
 | webmail.service.ipFamilies | list | `[]` |  |
 | webmail.service.ipFamilyPolicy | string | `""` | See the top-level service.ipFamilyPolicy. |
+| webmail.service.loadBalancerClass | string | `""` | See the top-level service.loadBalancerClass. |
 | webmail.service.port | int | `3000` |  |
 | webmail.service.type | string | `"ClusterIP"` |  |
 | webmail.serviceAccount.annotations | object | `{}` |  |
@@ -1070,10 +1085,12 @@ Bitnami Common is vendored in `charts/` and updated by Renovate together with `C
 | webmail.sessionSecret.secretKey | string | `"SESSION_SECRET"` |  |
 | webmail.sessionSecret.value | string | `""` | Fallback only, stored in a chart-managed Secret and visible in Helm's release history. Prefer existingSecret. |
 | webmail.settingsSync.enabled | bool | `false` |  |
-| webmail.sharedStore.existingSecret | string | `""` | Existing Secret with the full URL, e.g. redis://:password@valkey:6379/0 (rediss:// for TLS). |
+| webmail.sharedStore.allowNoPassword | bool | `false` | Accept a store without a password (SHARED_STORE_ALLOW_NO_PASSWORD). Only when nothing but the webmail pods can reach the store. |
+| webmail.sharedStore.existingSecret | string | `""` | Existing Secret with the full URL, e.g. redis://:password@valkey:6379/0 (rediss:// for TLS). Bulwark refuses a URL without a password and answers every request with 503 until it has one, unless allowNoPassword is set. |
 | webmail.sharedStore.keyPrefix | string | `""` | Key prefix (REDIS_KEY_PREFIX). Empty keeps Bulwark's default "bulwark:"; set one per release when several share a store. |
 | webmail.sharedStore.secretKey | string | `"REDIS_URL"` |  |
 | webmail.sharedStore.url | string | `""` | Fallback only, stored in a chart-managed Secret, since the URL usually carries the password. Prefer existingSecret. |
+| webmail.sidecars | list | `[]` | Extra containers in the webmail pod, as written. For sidecars that must start first, use extraInitContainers with restartPolicy: Always. |
 | webmail.stalwartFeatures | bool | `true` | Enables Stalwart-specific WebUI features (password change, Sieve management, vacation responder, account security, API keys, admin dashboard). Matches Bulwark's own default. |
 | webmail.startupProbe.enabled | bool | `true` |  |
 | webmail.startupProbe.failureThreshold | int | `30` |  |

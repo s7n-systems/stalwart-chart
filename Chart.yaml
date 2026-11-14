@@ -1,20 +1,77 @@
 ---
 apiVersion: "v2"
 name: "stalwart"
-description: "Helm chart for the Stalwart mail and collaboration server"
+description: "Helm chart for the Stalwart mail and collaboration server, with optional Bulwark webmail"
 type: "application"
-version: "0.5.0"
+version: "0.6.0"
 # Kept in step with image.tag in values.yaml.
 # renovate: image=docker.io/stalwartlabs/stalwart
 appVersion: "v1.1.0"
-home: "https://stalw.art"
+kubeVersion: ">=1.27.0-0"
+home: "https://github.com/s7n-systems/stalwart-chart"
 icon: "https://raw.githubusercontent.com/stalwartlabs/stalwart/main/img/logo-red.svg"
+keywords:
+  - "stalwart"
+  - "mail"
+  - "email"
+  - "smtp"
+  - "imap"
+  - "jmap"
+  - "caldav"
+  - "carddav"
+  - "webmail"
+  - "bulwark"
 sources:
+  - "https://github.com/s7n-systems/stalwart-chart"
   - "https://github.com/stalwartlabs/stalwart"
+  - "https://github.com/bulwarkmail/webmail"
+maintainers:
+  - name: "s7n systems"
+    email: "tom@sovereign-systems.eu"
+    url: "https://github.com/s7n-systems"
 dependencies:
   - name: "common"
     version: "2.41.0"
     repository: "oci://registry-1.docker.io/bitnamicharts"
+# Artifact Hub (https://artifacthub.io/docs/topics/annotations/helm/). Update `changes`
+# for every release; tests/render.py checks that `images` matches values.yaml.
 annotations:
   artifacthub.io/license: "Apache-2.0"
+  artifacthub.io/category: "networking"
+  artifacthub.io/prerelease: "false"
+  artifacthub.io/containsSecurityUpdates: "true"
+  artifacthub.io/links: |
+    - name: "Stalwart documentation"
+      url: "https://stalw.art/docs"
+    - name: "Bulwark documentation"
+      url: "https://bulwarkmail.org"
+    - name: "Upgrade notes"
+      url: "https://github.com/s7n-systems/stalwart-chart/blob/main/docs/upgrading.md"
+  artifacthub.io/images: |
+    - name: "stalwart"
+      image: "docker.io/stalwartlabs/stalwart:v1.1.0@sha256:f772aa6ef8cd8018969fa491640f1436b0270eb14e2c219b5f37f1a77020837e"
+    - name: "stalwart-cli"
+      image: "ghcr.io/stalwartlabs/cli:1.0.14@sha256:5b70732cb69cdab3ff0894c501544cf0bfa180fa75bcd0eeba4eebe04c1064e1"
+    - name: "python"
+      image: "docker.io/library/python:3.15-alpine@sha256:0f9552bb28711333da16915ec146f5e6bb44a7fdac9ced15dc17c2e0206346dd"
+    - name: "bulwark"
+      image: "ghcr.io/bulwarkmail/webmail:1.21.2@sha256:037b85b1433233d2d7eebb83f928df5ecc3b4adc91dc7e4c55f0a2f69024e754"
+  artifacthub.io/changes: |
+    - kind: "security"
+      description: "Bulwark 1.21.2, with fixes for about 20 security advisories"
+      links:
+        - name: "Bulwark 1.21.2"
+          url: "https://github.com/bulwarkmail/webmail/releases/tag/1.21.2"
+    - kind: "added"
+      description: "webmail.sharedStore.allowNoPassword; rendering fails for a shared store URL without a password, which Bulwark now refuses"
+    - kind: "added"
+      description: "tls: Stalwart's default certificate from a Secret, optionally issued by a cert-manager Certificate, with automatic reloads"
+    - kind: "added"
+      description: "helm test checks the management endpoint, each mail port and the webmail"
+    - kind: "added"
+      description: "NOTES.txt with access instructions and warnings for risky settings"
+    - kind: "added"
+      description: "sidecars and priorityClassName for Stalwart and the webmail, persistence.retentionPolicy, service.loadBalancerClass"
+    - kind: "added"
+      description: "Artifact Hub metadata"
 ...
