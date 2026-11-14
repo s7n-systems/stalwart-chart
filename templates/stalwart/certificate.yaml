@@ -1,0 +1,35 @@
+{{- if and .Values.tls.enabled .Values.tls.certManager.enabled }}
+{{- $cm := .Values.tls.certManager }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "stalwart.fullname" . }}
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "stalwart.labels" . | nindent 4 }}
+  {{- with (merge (dict) $cm.annotations .Values.additionalAnnotations) }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  secretName: {{ include "stalwart.tlsSecretName" . | quote }}
+  secretTemplate:
+    labels:
+      {{- include "stalwart.labels" . | nindent 6 }}
+  dnsNames:
+    {{- toYaml ($cm.dnsNames | default (list .Values.hostname)) | nindent 4 }}
+  {{- with $cm.duration }}
+  duration: {{ . | quote }}
+  {{- end }}
+  {{- with $cm.renewBefore }}
+  renewBefore: {{ . | quote }}
+  {{- end }}
+  privateKey:
+    algorithm: {{ $cm.privateKey.algorithm }}
+    {{- if ne $cm.privateKey.algorithm "Ed25519" }}
+    size: {{ $cm.privateKey.size | default (ternary 2048 256 (eq $cm.privateKey.algorithm "RSA")) }}
+    {{- end }}
+    rotationPolicy: {{ $cm.privateKey.rotationPolicy }}
+  issuerRef:
+    {{- toYaml $cm.issuerRef | nindent 4 }}
+{{- end }}

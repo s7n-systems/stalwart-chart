@@ -474,6 +474,15 @@ class ChartChecks(unittest.TestCase):
         self.assertEqual(env(dep)['REDIS_URL']['valueFrom']['secretKeyRef'], {'name': 'stalwart-webmail-env', 'key': 'redisUrl'})
         secret = next(doc for doc in docs if doc['kind'] == 'Secret' and doc['metadata']['name'] == 'stalwart-webmail-env')
         self.assertEqual(secret['stringData']['redisUrl'], 'redis://:pw@valkey:6379/0')
+        self.assertNotIn('SHARED_STORE_ALLOW_NO_PASSWORD', env(dep))
+
+        # A store without a password only with the explicit opt-in (Bulwark 1.21.2+).
+        _, dep = deployment({**session, 'sharedStore': {'url': 'redis://valkey:6379/0', 'allowNoPassword': True}})
+        self.assertEqual(env(dep)['SHARED_STORE_ALLOW_NO_PASSWORD']['value'], 'true')
+        deployment({**session, 'sharedStore': {'url': 'rediss://default:pw@valkey:6380'}})
+        # An unused fallback URL is not checked: existingSecret takes precedence.
+        _, dep = deployment({**session, 'sharedStore': {'existingSecret': 'valkey-url', 'url': 'redis://valkey:6379/0'}})
+        self.assertEqual(env(dep)['REDIS_URL']['valueFrom']['secretKeyRef']['name'], 'valkey-url')
 
         # Several replicas without any volume, and settings sync, with a store.
         multi = {'replicaCount': 3, 'adminPassword': {'value': 'x'}, 'sessionSecret': {'existingSecret': 'session'}, 'settingsSync': {'enabled': True}, 'sharedStore': {'existingSecret': 'valkey-url'}}
@@ -492,6 +501,8 @@ class ChartChecks(unittest.TestCase):
             {**multi, 'sharedStore': {}},                                      # settings sync without state
             {**multi, 'persistence': {'enabled': True}},                       # three pods on one RWO volume
             {**session, 'sharedStore': {'url': 'valkey:6379'}},                # not a redis URL
+            {**session, 'sharedStore': {'url': 'redis://valkey:6379/0'}},      # no password
+            {**session, 'sharedStore': {'url': 'redis://user@valkey:6379'}},   # user without password
             {'replicaCount': 2, 'adminPassword': {'value': 'x'}, 'sessionSecret': {'existingSecret': 'session'}},  # several replicas without a store
             {'replicaCount': 2, 'adminPassword': {'value': 'x'}, 'sessionSecret': {'existingSecret': 'session'}, 'persistence': {'enabled': True, 'accessMode': 'ReadWriteMany'}},  # RWX is no substitute
             {**multi, 'sessionSecret': {}},                                    # several replicas without a pinned secret
@@ -1281,14 +1292,18 @@ class ChartChecks(unittest.TestCase):
         self.assertEqual(management['from'], [{'podSelector': {'matchLabels': {'app.kubernetes.io/instance': 'stalwart'}}}, ingress_nginx])
         self.assertEqual(appended, extra)
         self.assertEqual(webmail['podSelector']['matchLabels']['app.kubernetes.io/component'], 'webmail')
-        self.assertEqual(webmail['ingress'], [{'ports': [{'port': 'http', 'protocol': 'TCP'}], 'from': [ingress_nginx]}])
+        # Restricted sources also admit the `helm test` pod.
+        test_pod = {'podSelector': {'matchLabels': {'app.kubernetes.io/instance': 'stalwart', 'app.kubernetes.io/component': 'test'}}}
+        self.assertEqual(webmail['ingress'], [{'ports': [{'port': 'http', 'protocol': 'TCP'}], 'from': [ingress_nginx, test_pod]}])
         # Release pods (webmail, provisioning and reconcile Jobs) match the management rule.
         for doc in docs:
             if doc['kind'] in ('Deployment', 'StatefulSet', 'Job'):
                 self.assertEqual(doc['spec']['template']['metadata']['labels']['app.kubernetes.io/instance'], 'stalwart')
         docs = render({'networkPolicy': {'enabled': True, 'mail': {'from': [relay]}}, 'service': {'ports': {'https': None, 'imaps': None, 'smtps': None}}})
         server = next(d for d in docs if d['kind'] == 'NetworkPolicy')['spec']
-        self.assertEqual(server['ingress'][0], {'ports': [{'port': 'smtp', 'protocol': 'TCP'}], 'from': [relay]})
+        self.assertEqual(server['ingress'][0], {'ports': [{'port': 'smtp', 'protocol': 'TCP'}], 'from': [relay, test_pod]})
+        docs = render({'networkPolicy': {'enabled': True, 'mail': {'from': [relay]}}, 'tests': {'enabled': False}})
+        self.assertEqual(next(d for d in docs if d['kind'] == 'NetworkPolicy')['spec']['ingress'][0]['from'], [relay])
         self.assertEqual(server['ingress'][1]['from'], [{'podSelector': {'matchLabels': {'app.kubernetes.io/instance': 'stalwart'}}}])
         # An Ingress or HTTPRoute on the management backend needs its controller allowed.
         domain = {'domain': 'example.org'}
@@ -1408,6 +1423,197 @@ class ChartChecks(unittest.TestCase):
         error = render({'provisioning': {'existingSecret': 'admin'},
                         'enterprise': {'apiKey': {'existingSecret': 'ent'}, 'licenseKey': {'existingSecret': 'license'}}}, succeeds=False)
         self.assertIn('enterprise.apiKey and enterprise.licenseKey are exclusive', error)
+
+
+
+class ExtrasChecks(unittest.TestCase):
+    def test_tls_and_cert_manager(self):
+        base = {'hostname': 'mail.example.org', 'domain': 'example.org', 'provisioning': {'existingSecret': 'admin'}}
+        docs = render({**base, 'tls': {'enabled': True}})
+        self.assertFalse([d for d in docs if d['kind'] == 'Certificate'])
+        pod = workload(docs)['spec']['template']['spec']
+        self.assertIn({'name': 'tls', 'secret': {'secretName': 'stalwart-tls'}}, pod['volumes'])
+        self.assertIn({'name': 'tls', 'mountPath': '/etc/stalwart/tls', 'readOnly': True}, pod['containers'][0]['volumeMounts'])
+        lines = plan_lines(docs)
+        certificate = next(line for line in lines if line['object'] == 'Certificate')
+        self.assertEqual(certificate['matchOn'], ['certificate'])
+        self.assertEqual(certificate['value']['chart-tls']['certificate'], {'@type': 'File', 'filePath': '/etc/stalwart/tls/tls.crt'})
+        # One update with hostname and domain: Stalwart rejects defaultCertificateId alone.
+        settings = [line for line in lines if line['object'] == 'SystemSettings']
+        self.assertEqual(settings, [{'@type': 'update', 'object': 'SystemSettings', 'value': {
+            'defaultHostname': 'mail.example.org', 'defaultDomainId': '#default-domain', 'defaultCertificateId': '#chart-tls'}}])
+        self.assertLess(lines.index(certificate), lines.index(settings[0]))
+        # The reload CronJob runs with tls, without certificateReload.enabled.
+        self.assertTrue([d for d in docs if d['kind'] == 'CronJob'])
+
+        docs = render({**base, 'tls': {'enabled': True, 'secretName': 'mail-tls', 'certManager': {
+            'enabled': True, 'issuerRef': {'name': 'letsencrypt'}, 'dnsNames': ['mail.example.org', 'imap.example.org'],
+            'renewBefore': '720h', 'annotations': {'cert-manager.io/owner': 'mail'}}}})
+        cert = next(d for d in docs if d['kind'] == 'Certificate')
+        self.assertEqual(cert['spec']['secretName'], 'mail-tls')
+        self.assertEqual(cert['spec']['dnsNames'], ['mail.example.org', 'imap.example.org'])
+        self.assertEqual(cert['spec']['issuerRef'], {'name': 'letsencrypt', 'kind': 'ClusterIssuer', 'group': 'cert-manager.io'})
+        self.assertEqual(cert['spec']['privateKey'], {'algorithm': 'ECDSA', 'size': 256, 'rotationPolicy': 'Always'})
+        self.assertEqual(cert['spec']['renewBefore'], '720h')
+        self.assertNotIn('duration', cert['spec'])
+        self.assertEqual(cert['metadata']['annotations'], {'cert-manager.io/owner': 'mail'})
+        self.assertIn({'name': 'tls', 'secret': {'secretName': 'mail-tls'}}, workload(docs)['spec']['template']['spec']['volumes'])
+        cert = next(d for d in render({**base, 'tls': {'enabled': True, 'certManager': {'enabled': True, 'issuerRef': {'name': 'ca', 'kind': 'Issuer'},
+                                                                                        'privateKey': {'algorithm': 'Ed25519'}}}}) if d['kind'] == 'Certificate')
+        self.assertEqual(cert['spec']['dnsNames'], ['mail.example.org'])
+        self.assertNotIn('size', cert['spec']['privateKey'])
+        # The key size follows the algorithm unless set; incompatible sizes fail the schema.
+        def key(private_key):
+            values = {**base, 'tls': {'enabled': True, 'certManager': {'enabled': True, 'issuerRef': {'name': 'ca'}, 'privateKey': private_key}}}
+            return next(d for d in render(values) if d['kind'] == 'Certificate')['spec']['privateKey']
+        self.assertEqual(key({'algorithm': 'RSA'})['size'], 2048)
+        self.assertEqual(key({'algorithm': 'RSA', 'size': 4096})['size'], 4096)
+        self.assertEqual(key({'size': 384})['size'], 384)
+        for private_key in [{'algorithm': 'RSA', 'size': 256}, {'algorithm': 'ECDSA', 'size': 2048}, {'size': 512}]:
+            with self.subTest(private_key=private_key):
+                render({**base, 'tls': {'enabled': True, 'certManager': {'enabled': True, 'issuerRef': {'name': 'ca'}, 'privateKey': private_key}}}, succeeds=False)
+
+        for invalid, message in [
+            ({'domain': 'example.org', 'provisioning': {'existingSecret': 'admin'}, 'tls': {'enabled': True}}, 'tls.enabled requires hostname'),
+            ({**base, 'tls': {'certManager': {'enabled': True, 'issuerRef': {'name': 'x'}}}}, 'requires tls.enabled'),
+            ({**base, 'tls': {'enabled': True, 'certManager': {'enabled': True}}}, 'issuerRef.name is required'),
+            ({'hostname': 'mail.example.org', 'domain': 'example.org', 'tls': {'enabled': True}}, 'provisioning.existingSecret or provisioning.password'),
+        ]:
+            with self.subTest(message=message):
+                self.assertIn(message, render(invalid, succeeds=False))
+
+    def test_helm_test_pod(self):
+        docs = render({'hostname': 'mail.example.org', 'domain': 'example.org', 'provisioning': {'existingSecret': 'admin'},
+                       'service': {'ports': {'https': None, 'sieve': {'port': 4190, 'containerPort': 4190, 'protocol': 'TCP'},
+                                             'custom': {'port': 2525, 'containerPort': 2525, 'protocol': 'TCP'}}},
+                       'webmail': {'enabled': True}})
+        pod = next(d for d in docs if d['kind'] == 'Pod')
+        self.assertEqual(pod['metadata']['name'], 'stalwart-test')
+        self.assertEqual(pod['metadata']['annotations'], {'helm.sh/hook': 'test', 'helm.sh/hook-delete-policy': 'before-hook-creation,hook-succeeded'})
+        self.assertEqual(pod['metadata']['labels']['app.kubernetes.io/component'], 'test')
+        container = pod['spec']['containers'][0]
+        self.assertTrue(container['image'].startswith('docker.io/library/python@sha256:'))
+        self.assertEqual(container['args'], [(ROOT / 'files' / 'helm-test.py').read_text()])
+        checks = {c['name']: c for c in json.loads(next(e['value'] for e in container['env'] if e['name'] == 'CHECKS'))}
+        self.assertEqual(sorted(checks), ['custom', 'imaps', 'management', 'sieve', 'smtp', 'smtps', 'webmail'])
+        self.assertEqual(checks['management']['url'], 'http://stalwart-management.mail.svc:8080/healthz/ready')
+        self.assertEqual(checks['webmail']['url'], 'http://stalwart-webmail.mail.svc:3000/api/health')
+        self.assertEqual({k: checks['imaps'][k] for k in ('host', 'port', 'tls', 'greeting', 'sni')},
+                         {'host': 'stalwart.mail.svc', 'port': 993, 'tls': True, 'greeting': '* OK', 'sni': 'mail.example.org'})
+        self.assertEqual((checks['smtp']['tls'], checks['smtp']['greeting']), (False, '220'))
+        self.assertEqual((checks['custom']['tls'], checks['custom']['greeting']), (False, ''))
+        # Recovery mode: only the management listener is open.
+        docs = render({'recoveryMode': {'enabled': True}})
+        container = next(d for d in docs if d['kind'] == 'Pod')['spec']['containers'][0]
+        self.assertEqual([c['name'] for c in json.loads(container['env'][0]['value'])], ['management'])
+        self.assertFalse([d for d in render({'tests': {'enabled': False}}) if d['kind'] == 'Pod'])
+
+    def test_scheduling_extras(self):
+        sidecar = {'name': 'shipper', 'image': 'example.org/shipper@sha256:' + '0' * 64}
+        docs = render({'priorityClassName': 'mail', 'sidecars': [sidecar], 'persistence': {'enabled': True, 'retentionPolicy': {'whenScaled': 'Delete'}},
+                       'service': {'type': 'LoadBalancer', 'loadBalancerClass': 'service.k8s.aws/nlb'},
+                       'webmail': {'enabled': True, 'priorityClassName': 'web', 'sidecars': [sidecar], 'service': {'type': 'LoadBalancer', 'loadBalancerClass': 'lb'}}})
+        statefulset = workload(docs)
+        self.assertEqual(statefulset['spec']['persistentVolumeClaimRetentionPolicy'], {'whenScaled': 'Delete'})
+        self.assertEqual(statefulset['spec']['template']['spec']['priorityClassName'], 'mail')
+        self.assertEqual([c['name'] for c in statefulset['spec']['template']['spec']['containers']], ['stalwart', 'shipper'])
+        deployment = next(d for d in docs if d['kind'] == 'Deployment')
+        self.assertEqual(deployment['spec']['template']['spec']['priorityClassName'], 'web')
+        self.assertEqual([c['name'] for c in deployment['spec']['template']['spec']['containers']], ['webmail', 'shipper'])
+        services = {d['metadata']['name']: d['spec'] for d in docs if d['kind'] == 'Service'}
+        self.assertEqual(services['stalwart']['loadBalancerClass'], 'service.k8s.aws/nlb')
+        self.assertEqual(services['stalwart-webmail']['loadBalancerClass'], 'lb')
+        # Defaults add nothing, and loadBalancerClass only applies to LoadBalancer Services.
+        docs = render({'service': {'loadBalancerClass': 'x'}, 'webmail': {'enabled': True}})
+        self.assertNotIn('persistentVolumeClaimRetentionPolicy', workload(docs)['spec'])
+        self.assertNotIn('priorityClassName', workload(docs)['spec']['template']['spec'])
+        self.assertFalse(any('loadBalancerClass' in d['spec'] for d in docs if d['kind'] == 'Service'))
+        render({'persistence': {'retentionPolicy': {'whenDeleted': 'Keep'}}}, succeeds=False)
+
+    def test_artifact_hub_images_match_values(self):
+        chart = yaml.safe_load((ROOT / 'Chart.yaml').read_text())
+        listed = sorted(entry['image'] for entry in yaml.safe_load(chart['annotations']['artifacthub.io/images']))
+        values = yaml.safe_load((ROOT / 'values.yaml').read_text())
+        roots = [values['image'], values['provisioning']['image'], values['provisioning']['reconcile']['image'], values['webmail']['image']]
+        self.assertEqual(listed, sorted(f"{r['registry']}/{r['repository']}:{r['tag']}@{r['digest']}" for r in roots))
+        self.assertEqual(chart['appVersion'], values['image']['tag'])
+        for key in ('artifacthub.io/changes', 'artifacthub.io/links'):
+            self.assertIsInstance(yaml.safe_load(chart['annotations'][key]), list)
+
+
+
+def load_helm_test():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('helm_test', ROOT / 'files' / 'helm-test.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class HelmTestScriptChecks(unittest.TestCase):
+    """files/helm-test.py against local servers."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.script = load_helm_test()
+
+    def serve(self, handler):
+        import socket
+        import threading
+        server = socket.create_server(('127.0.0.1', 0))
+        self.addCleanup(server.close)
+
+        def run():
+            connection, _ = server.accept()
+            with connection:
+                handler(connection)
+        threading.Thread(target=run, daemon=True).start()
+        return server.getsockname()[1]
+
+    def test_fragmented_greeting(self):
+        import time
+
+        def handler(connection):
+            for byte in b'22':
+                connection.sendall(bytes([byte]))
+                time.sleep(0.05)
+            connection.sendall(b'0 mail.example.org ESMTP\r\n250 more\r\n')
+        port = self.serve(handler)
+        result = self.script.tcp({'host': '127.0.0.1', 'port': port, 'greeting': '220'})
+        self.assertEqual(result, 'connected, 220 mail.example.org ESMTP')
+
+    def test_wrong_and_missing_greeting(self):
+        port = self.serve(lambda c: c.sendall(b'554 go away\r\n'))
+        with self.assertRaisesRegex(RuntimeError, "'554 go away'"):
+            self.script.tcp({'host': '127.0.0.1', 'port': port, 'greeting': '220'})
+        port = self.serve(lambda c: None)   # closes without a greeting
+        with self.assertRaisesRegex(RuntimeError, "got ''"):
+            self.script.tcp({'host': '127.0.0.1', 'port': port, 'greeting': '220'})
+
+    def test_http_requires_exactly_200(self):
+        def answer(status, headers=''):
+            def handler(connection):
+                connection.recv(4096)
+                connection.sendall(f'HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n{headers}\r\n'.encode())
+            return f'http://127.0.0.1:{self.serve(handler)}/'
+        self.assertEqual(self.script.http({'url': answer('200 OK')}), 'HTTP 200')
+        for status, headers in [('204 No Content', ''), ('302 Found', 'Location: http://127.0.0.1:1/\r\n'), ('503 Service Unavailable', '')]:
+            with self.subTest(status=status), self.assertRaisesRegex(RuntimeError, 'expected HTTP 200, got ' + status[:3]):
+                self.script.http({'url': answer(status, headers)})
+
+    def test_main_reports_failures(self):
+        import contextlib
+        import io
+        port = self.serve(lambda c: c.sendall(b'* OK ready\r\n'))
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = self.script.main([{'name': 'imap', 'type': 'tcp', 'host': '127.0.0.1', 'port': port, 'greeting': '* OK'},
+                                     {'name': 'closed', 'type': 'tcp', 'host': '127.0.0.1', 'port': 1}])
+        self.assertEqual(code, 1)
+        self.assertIn('ok    imap: connected, * OK ready', output.getvalue())
+        self.assertIn('FAIL  closed:', output.getvalue())
+        self.assertIn('1 check(s) failed', output.getvalue())
+
 
 if __name__ == '__main__':
     unittest.main()

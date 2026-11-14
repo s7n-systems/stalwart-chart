@@ -1,0 +1,103 @@
+{{- $fullname := include "stalwart.fullname" . -}}
+{{- $ns := .Release.Namespace -}}
+Stalwart {{ .Chart.AppVersion }} is deployed as {{ $fullname }} in namespace {{ $ns }}.
+{{- if .Values.recoveryMode.enabled }}
+
+RECOVERY MODE: mail services are suspended; only the management listener is open.
+
+  kubectl --namespace {{ $ns }} port-forward svc/{{ $fullname }}-management 8080:{{ .Values.management.servicePort }}
+
+Open http://localhost:8080/admin and sign in with the recovery administrator. When
+you are done, run the same helm upgrade with recoveryMode.enabled=false.
+{{- else }}
+
+Web UI, JMAP and DAV:
+{{- if .Values.ingress.enabled }}
+{{- range (include "stalwart.ingressHosts" . | fromYamlArray) }}
+  {{ include "stalwart.ingressScheme" (dict "host" .host "tls" $.Values.ingress.tls) }}://{{ .host }}/
+{{- end }}
+{{- else if and .Values.gatewayAPI.httpRoute.enabled .Values.gatewayAPI.httpRoute.hostnames }}
+{{- range .Values.gatewayAPI.httpRoute.hostnames }}
+  {{ . }}
+{{- end }}
+  over the Gateway's listeners: https where a listener terminates TLS for the host.
+{{- else }}
+  kubectl --namespace {{ $ns }} port-forward svc/{{ $fullname }}-management 8080:{{ .Values.management.servicePort }}
+  then open http://localhost:8080/admin
+{{- end }}
+{{- if and .Values.service.enabled .Values.service.ports }}
+
+Mail ports on Service {{ $fullname }} ({{ .Values.service.type }}):
+{{- range $name, $port := .Values.service.ports }}
+{{- if $port }}
+  {{ printf "%-11s" $name }} {{ $port.port }}/{{ $port.protocol | default "TCP" }}
+{{- end }}
+{{- end }}
+{{- if eq .Values.service.type "LoadBalancer" }}
+
+Point the MX record and the mail clients' host at the load balancer's address:
+
+  kubectl --namespace {{ $ns }} get svc {{ $fullname }}
+{{- else if and (eq .Values.service.type "ClusterIP") (not .Values.gatewayAPI.tcpRoutes) }}
+
+The Service is cluster-internal: expose the mail ports with service.type
+LoadBalancer or Gateway API TCPRoutes (gatewayAPI.tcpRoutes).
+{{- end }}
+{{- end }}
+{{- if .Values.webmail.enabled }}
+
+Webmail (Bulwark):
+{{- if .Values.webmail.ingress.enabled }}
+{{- $host := include "stalwart.webmailIngressHost" . }}
+  {{ include "stalwart.ingressScheme" (dict "host" $host "tls" .Values.webmail.ingress.tls) }}://{{ $host }}/
+{{- else if .Values.webmail.gatewayAPI.httpRoute.enabled }}
+{{- range (include "stalwart.webmailGatewayHostnames" . | fromYamlArray) }}
+  {{ . }}
+{{- end }}
+  over the Gateway's listeners: https where a listener terminates TLS for the host.
+{{- else }}
+  kubectl --namespace {{ $ns }} port-forward svc/{{ include "stalwart.webmailFullname" . }} 3000:{{ .Values.webmail.service.port }}
+  then open http://localhost:3000/
+{{- end }}
+{{- end }}
+{{- if .Values.tls.enabled }}
+
+TLS: Stalwart uses the certificate in Secret {{ include "stalwart.tlsSecretName" . }} for {{ .Values.hostname }}.
+The CronJob {{ $fullname }}-certificate-reload loads renewals.
+{{- if .Values.tls.certManager.enabled }}
+cert-manager issues it (Certificate {{ $fullname }}); the pods start once it exists:
+
+  kubectl --namespace {{ $ns }} get certificate {{ $fullname }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if eq (include "stalwart.provisioningEnabled" .) "true" }}
+
+The provisioning Job applies the chart's server settings after every install and
+upgrade. If they did not take effect, check its log:
+
+  kubectl --namespace {{ $ns }} logs job/{{ $fullname }}-provisioning
+{{- end }}
+{{- if .Values.tests.enabled }}
+
+Check that everything answers:
+
+  helm test {{ .Release.Name }} --namespace {{ $ns }}
+{{- end }}
+{{- $warnings := list }}
+{{- if and (eq .Values.dataStore.backend "rocksdb") (not .Values.config) (not .Values.persistence.enabled) (not .Values.recoveryMode.enabled) }}
+{{- $warnings = append $warnings "persistence.enabled is false: a local data store is lost whenever a pod restarts." }}
+{{- end }}
+{{- if and .Values.recoveryAdmin.enabled (not .Values.recoveryMode.enabled) }}
+{{- $warnings = append $warnings "recoveryAdmin is still enabled. Disable it once a permanent administrator exists (see First-time setup in the README)." }}
+{{- end }}
+{{- if and .Values.webmail.enabled .Values.webmail.sharedStore.allowNoPassword }}
+{{- $warnings = append $warnings "webmail.sharedStore.allowNoPassword is set: make sure only the webmail pods can reach the store." }}
+{{- end }}
+{{- if $warnings }}
+
+WARNING:
+{{- range $warnings }}
+  - {{ . }}
+{{- end }}
+{{- end }}

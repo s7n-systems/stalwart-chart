@@ -17,6 +17,9 @@ spec:
   ipFamilies:
     {{- toYaml . | nindent 4 }}
   {{- end }}
+  {{- if and (eq .Values.webmail.service.type "LoadBalancer") .Values.webmail.service.loadBalancerClass }}
+  loadBalancerClass: {{ .Values.webmail.service.loadBalancerClass | quote }}
+  {{- end }}
   selector:
     {{- include "stalwart.webmailSelectorLabels" . | nindent 4 }}
   ports:

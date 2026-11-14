@@ -225,6 +225,147 @@
         }
       }
     },
+    "tls": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "secretName": {
+          "type": "string",
+          "pattern": "^([a-z0-9]([-a-z0-9.]*[a-z0-9])?)?$",
+          "maxLength": 253
+        },
+        "certManager": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "issuerRef": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "kind": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "group": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            },
+            "dnsNames": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^(\\*\\.)?[a-z0-9]([-a-z0-9.]*[a-z0-9])?$"
+              },
+              "uniqueItems": true
+            },
+            "duration": {
+              "type": "string",
+              "pattern": "^([0-9]+(\\.[0-9]+)?(h|m|s|ms|us|ns))*$"
+            },
+            "renewBefore": {
+              "type": "string",
+              "pattern": "^([0-9]+(\\.[0-9]+)?(h|m|s|ms|us|ns))*$"
+            },
+            "privateKey": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "algorithm": {
+                  "enum": [
+                    "RSA",
+                    "ECDSA",
+                    "Ed25519"
+                  ]
+                },
+                "size": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "rotationPolicy": {
+                  "enum": [
+                    "Always",
+                    "Never"
+                  ]
+                }
+              },
+              "allOf": [
+                {
+                  "if": {
+                    "properties": {
+                      "algorithm": {
+                        "const": "RSA"
+                      }
+                    },
+                    "required": [
+                      "algorithm"
+                    ]
+                  },
+                  "then": {
+                    "properties": {
+                      "size": {
+                        "anyOf": [
+                          {
+                            "type": "null"
+                          },
+                          {
+                            "type": "integer",
+                            "minimum": 2048,
+                            "maximum": 8192
+                          }
+                        ]
+                      }
+                    }
+                  }
+                },
+                {
+                  "if": {
+                    "properties": {
+                      "algorithm": {
+                        "const": "ECDSA"
+                      }
+                    },
+                    "required": [
+                      "algorithm"
+                    ]
+                  },
+                  "then": {
+                    "properties": {
+                      "size": {
+                        "enum": [
+                          null,
+                          256,
+                          384,
+                          521
+                        ]
+                      }
+                    }
+                  }
+                }
+              ]
+            },
+            "annotations": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
     "config": {
       "type": "object",
       "properties": {
@@ -284,6 +425,9 @@
             "Local",
             "Cluster"
           ]
+        },
+        "loadBalancerClass": {
+          "type": "string"
         },
         "ports": {
           "type": "object",
@@ -1684,6 +1828,9 @@
             },
             "keyPrefix": {
               "type": "string"
+            },
+            "allowNoPassword": {
+              "type": "boolean"
             }
           }
         },
@@ -1790,6 +1937,9 @@
                   "IPv6"
                 ]
               }
+            },
+            "loadBalancerClass": {
+              "type": "string"
             },
             "port": {
               "type": "integer",
@@ -1997,6 +2147,18 @@
         "tolerations": {
           "type": "array"
         },
+        "priorityClassName": {
+          "type": "string"
+        },
+        "sidecars": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "name"
+            ]
+          }
+        },
         "extraEnv": {
           "type": "object"
         },
@@ -2145,6 +2307,18 @@
     "topologySpreadConstraints": {
       "type": "array"
     },
+    "priorityClassName": {
+      "type": "string"
+    },
+    "sidecars": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "name"
+        ]
+      }
+    },
     "lifecycleHooks": {
       "type": "object"
     },
@@ -2190,6 +2364,24 @@
         },
         "size": {
           "type": "string"
+        },
+        "retentionPolicy": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "whenDeleted": {
+              "enum": [
+                "Retain",
+                "Delete"
+              ]
+            },
+            "whenScaled": {
+              "enum": [
+                "Retain",
+                "Delete"
+              ]
+            }
+          }
         }
       }
     },
@@ -2201,6 +2393,18 @@
     },
     "common": {
       "type": "object"
+    },
+    "tests": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "resources": {
+          "type": "object"
+        }
+      }
     }
   },
   "additionalProperties": false

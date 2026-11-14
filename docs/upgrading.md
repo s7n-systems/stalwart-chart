@@ -1,5 +1,22 @@
 # Upgrading
 
+## Chart 0.6.0: Bulwark 1.21.2, TLS from cert-manager, helm test
+
+Bulwark 1.21.2 fixes about 20 security advisories. Check these before upgrading:
+
+- **Shared store** (`webmail.sharedStore`): Bulwark refuses a store URL without a password and answers every request with 503 until it has one. Put the password in the URL (`redis://:<password>@host:6379/0`), or set the new `webmail.sharedStore.allowNoPassword: true` if only the webmail pods can reach the store. The chart now fails rendering for a password-less `sharedStore.url`; it can't check a URL in `existingSecret`.
+- **Admin dashboard**: only superusers of the server in `JMAP_SERVER_URL` can open it as Stalwart admins. With the chart's single server nothing changes; servers added through `JMAP_SERVERS` in `webmail.extraEnv` need `"adminAccess": true`.
+- **Single sign-on with several sign-in servers** (`JMAP_SERVERS` or custom servers in `webmail.extraEnv`): each provider's issuer must match the address it was discovered at; set `oauth.issuerUrl` per server, or `webmail.oauth.issuerUrl`. The chart's default single server keeps working.
+
+The Python helper image's digest is refreshed too (only its riscv64 image changed).
+
+New, off or without effect by default:
+
+- `tls`: Stalwart's default certificate from a Secret, optionally issued by a cert-manager Certificate (`tls.certManager`), with the certificate reload CronJob switched on automatically. It replaces the README's earlier recipe with `extraVolumes` and `provisioning.extraPlan`; that recipe also needed `hostname`, since Stalwart only accepts a default certificate together with the default hostname. To move to `tls`, remove the volume, mount and the two plan entries, then set `tls.enabled` and `tls.secretName` to the existing Secret. The certificate is matched by its file path, so with the recipe's path `/etc/stalwart/tls` the existing object is updated, not duplicated.
+- `helm test <release>` runs a pod that checks the management endpoint, each port in `service.ports` and the webmail. Disable it with `tests.enabled: false`. With `networkPolicy.mail.from` or `networkPolicy.webmail.from` set, the policies now also admit the test pod.
+- `sidecars`, `priorityClassName` (both also under `webmail`), `persistence.retentionPolicy` and `service.loadBalancerClass` (also `webmail.service.loadBalancerClass`).
+- `NOTES.txt` after install and upgrade, and Artifact Hub metadata in `Chart.yaml`.
+
 ## Chart 0.5.0: webmail branding, Stalwart Enterprise settings
 
 No steps are needed: the new values are off or empty by default.

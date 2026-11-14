@@ -2,7 +2,8 @@
 .agents/
 .codex/
 .claude/
-tests/
+.qwen/
+/tests/
 __pycache__/
 .github/
 .yamllint.yaml

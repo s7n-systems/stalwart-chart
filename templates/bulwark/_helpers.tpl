@@ -113,6 +113,10 @@ true
 {{- if and (gt (int (include "stalwart.webmailEffectiveMaxReplicas" .)) 1) .Values.webmail.persistence.enabled (eq .Values.webmail.persistence.accessMode "ReadWriteOnce") -}}
 {{- fail "webmail.replicaCount/autoscaling.maxReplicas > 1 cannot share a ReadWriteOnce volume: with webmail.sharedStore the replicas need none, so set webmail.persistence.enabled=false (after the one-replica import, see the README)" -}}
 {{- end -}}
+{{/* Bulwark 1.21.2+ answers 503 to everything with a password-less store URL. */}}
+{{- if and .Values.webmail.sharedStore.url (not .Values.webmail.sharedStore.existingSecret) (not .Values.webmail.sharedStore.allowNoPassword) (not (regexMatch "^rediss?://[^/@]*:[^/@]+@" .Values.webmail.sharedStore.url)) -}}
+{{- fail "webmail.sharedStore.url has no password, which Bulwark refuses: use redis://:password@host:port, or set webmail.sharedStore.allowNoPassword=true if only the webmail pods can reach the store" -}}
+{{- end -}}
 {{- if and .Values.webmail.settingsSync.enabled (not .Values.webmail.persistence.enabled) (not (or .Values.webmail.sharedStore.existingSecret .Values.webmail.sharedStore.url)) -}}
 {{- fail "webmail.settingsSync.enabled requires webmail.persistence.enabled or webmail.sharedStore" -}}
 {{- end -}}
@@ -192,6 +196,10 @@ true
 {{- with .Values.webmail.sharedStore.keyPrefix }}
 - name: REDIS_KEY_PREFIX
   value: {{ . | quote }}
+{{- end }}
+{{- if .Values.webmail.sharedStore.allowNoPassword }}
+- name: SHARED_STORE_ALLOW_NO_PASSWORD
+  value: "true"
 {{- end }}
 {{- end }}
 {{- if or .Values.webmail.sessionSecret.existingSecret .Values.webmail.sessionSecret.value }}

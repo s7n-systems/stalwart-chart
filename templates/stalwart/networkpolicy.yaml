@@ -31,6 +31,7 @@ spec:
       {{- with .Values.networkPolicy.mail.from }}
       from:
         {{- toYaml . | nindent 8 }}
+        {{- include "stalwart.testPeer" $ | nindent 8 }}
       {{- end }}
     {{- end }}
     # Management listener: this release's pods and networkPolicy.management.from.

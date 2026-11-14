@@ -17,6 +17,34 @@ provisioning:
 certificateReload:
   enabled: true
 domain: "example.org"
+hostname: "mail.example.org"
+tls:
+  enabled: true
+  certManager:
+    enabled: true
+    issuerRef:
+      name: "letsencrypt"
+    dnsNames: ["mail.example.org", "imap.example.org"]
+service:
+  type: "LoadBalancer"
+  loadBalancerClass: "service.k8s.aws/nlb"
+priorityClassName: "mail-critical"
+# A sidecar that passes the chart's Kyverno policies.
+sidecars:
+  - name: "log-shipper"
+    image: "docker.io/library/python@sha256:0f9552bb28711333da16915ec146f5e6bb44a7fdac9ced15dc17c2e0206346dd"
+    command: ["sleep", "infinity"]
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 65532
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop: ["ALL"]
+    resources:
+      requests:
+        cpu: "5m"
+        memory: "16Mi"
 ingress:
   enabled: true
   className: "nginx"
@@ -76,6 +104,7 @@ coordinator:
 webmail:
   enabled: true
   jmapServerUrl: "https://mail.example.org"
+  priorityClassName: "mail-critical"
   logFormat: "json"
   branding:
     files:
