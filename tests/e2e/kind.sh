@@ -12,6 +12,7 @@
 #   5. the credential is revoked in Stalwart (as after a database reset): the next upgrade
 #      publishes a new one; the consumer logs in with it after its restart
 #   6. helm uninstall removes the Secret with the release
+# After step 1, `helm test` checks the management endpoint and every mail port.
 #
 # Requires kind, kubectl, helm, python3 with PyYAML and Docker (or Podman with
 # KIND_EXPERIMENTAL_PROVIDER=podman). KEEP=1 leaves the cluster running.
@@ -126,6 +127,14 @@ check "RBAC: the Job may update its Secret" test "$(kubectl auth can-i update se
 check "RBAC: the Job may restart Stalwart" test "$(kubectl auth can-i patch statefulsets/stalwart -n mail --as "$sa")" = "yes"
 check "RBAC: the Job may not read other Secrets" test "$(kubectl auth can-i get secrets/stalwart-admin -n mail --as "$sa")" = "no"
 check "RBAC: the Job may not list Secrets" test "$(kubectl auth can-i list secrets -n apps --as "$sa")" = "no"
+# The chart's helm test hook (templates/tests), against the running release. A successful run
+# deletes its pod; a failed one stays, so its log explains the failure.
+if helm test stalwart --namespace mail --timeout 5m >/dev/null; then
+  ok "helm test"
+else
+  fail "helm test"
+  kubectl --namespace mail logs stalwart-test >&2 || true
+fi
 
 step "2. the consumer, deployed after Stalwart, starts with the password"
 sed "s#image: \"IMAGE\"#image: \"$(image provisioning reconcile image)\"#" "$here/kind-consumer.yaml" | kubectl apply -f - >/dev/null

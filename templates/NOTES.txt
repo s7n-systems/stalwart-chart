@@ -91,6 +91,27 @@ Check that everything answers:
 {{- if and .Values.recoveryAdmin.enabled (not .Values.recoveryMode.enabled) }}
 {{- $warnings = append $warnings "recoveryAdmin is still enabled. Disable it once a permanent administrator exists (see First-time setup in the README)." }}
 {{- end }}
+{{- $plain := list }}
+{{- $v := .Values }}
+{{- range $name, $value := dict
+      "recoveryAdmin.password" (and $v.recoveryAdmin.enabled $v.recoveryAdmin.password)
+      "dataStore.postgresql.password" $v.dataStore.postgresql.password
+      "blobStore.s3.accessKeyId/secretKey" (or $v.blobStore.s3.accessKeyId $v.blobStore.s3.secretKey)
+      "provisioning.password" $v.provisioning.password
+      "metrics.auth.password" $v.metrics.auth.password
+      "coordinator.nats.password" $v.coordinator.nats.password
+      "extraSecretEnv" $v.extraSecretEnv
+      "webmail.sessionSecret.value" (and $v.webmail.enabled $v.webmail.sessionSecret.value)
+      "webmail.adminPassword.value" (and $v.webmail.enabled $v.webmail.adminPassword.value)
+      "webmail.sharedStore.url" (and $v.webmail.enabled $v.webmail.sharedStore.url)
+      "webmail.oauth.clientSecret" (and $v.webmail.enabled $v.webmail.oauth.clientSecret) }}
+{{- if $value }}
+{{- $plain = append $plain $name }}
+{{- end }}
+{{- end }}
+{{- if $plain }}
+{{- $warnings = append $warnings (printf "Credentials set as plain values are kept in Helm's release history: %s. Prefer their existingSecret settings." (join ", " $plain)) }}
+{{- end }}
 {{- if and .Values.webmail.enabled .Values.webmail.sharedStore.allowNoPassword }}
 {{- $warnings = append $warnings "webmail.sharedStore.allowNoPassword is set: make sure only the webmail pods can reach the store." }}
 {{- end }}

@@ -480,12 +480,16 @@ networkPolicy:
 persistence:
   # -- Disabled for external PostgreSQL/S3; enable for local durable stores.
   enabled: false
+  # -- Mount an existing claim instead of the StatefulSet's claim template, e.g. to restore or
+  # adopt a RocksDB volume. One replica only, since every pod would mount the same claim.
+  existingClaim: ""
   accessMode: "ReadWriteOnce"
   # -- Empty uses the cluster default; "-" explicitly requests no storage class.
   storageClass: ""
   size: "20Gi"
   # -- StatefulSet persistentVolumeClaimRetentionPolicy: whenDeleted and whenScaled,
-  # each Retain or Delete. Empty keeps Kubernetes' default, Retain for both.
+  # each Retain or Delete. Empty keeps Kubernetes' default, Retain for both. Applies only
+  # to claims the StatefulSet creates from its template, not to existingClaim.
   retentionPolicy: {}
 
 # Starting requests for a small installation; tune using observed usage.
@@ -1059,6 +1063,9 @@ webmail:
   # or "hard" -- see the top-level podAntiAffinityPreset for details.
   podAntiAffinityPreset: ""
   tolerations: []
+  # -- Topology spread constraints for the webmail pods, e.g. across zones;
+  # podAntiAffinityPreset only covers nodes.
+  topologySpreadConstraints: []
   # -- PriorityClass for the webmail pods.
   priorityClassName: ""
   # -- Extra containers in the webmail pod, as written. For sidecars that must start
@@ -1153,7 +1160,8 @@ hostAliases: []
 lifecycleHooks: {}
 
 # `helm test <release>` runs a pod that checks the management endpoint, each port in
-# service.ports (TCP, TLS handshake and protocol greeting) and the webmail. Helm deletes
+# service.ports (TCP, TLS handshake and protocol greeting) and the webmail, through the
+# Services: each check reaches one ready pod, not every replica. Helm deletes
 # it after a successful run. Installs and syncs never run it: only `helm test` and
 # `helmfile test` do; Argo CD skips it entirely.
 tests:

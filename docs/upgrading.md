@@ -1,5 +1,46 @@
 # Upgrading
 
+## Chart 0.6.1: autoscaling checks, existingClaim
+
+No steps are needed, except in one case: CPU and memory autoscaling (`autoscaling` or `webmail.autoscaling` with a utilization target) now requires `resources.requests` for that resource on every sidecar and native sidecar (`extraInitContainers` with `restartPolicy: Always`). Rendering fails without them. Such a configuration never scaled: Kubernetes cannot compute the utilization when a container in the pod lacks the request. Add the requests, or scale on raw `metrics`.
+
+New: `persistence.existingClaim` mounts an existing claim instead of the claim template (one replica only), `webmail.topologySpreadConstraints`, and a NOTES.txt warning for credentials set as plain values.
+
+### Switching a running release to `persistence.existingClaim`
+
+A new installation can use `existingClaim` directly. A release that already runs with `persistence.enabled` has a StatefulSet with a claim template, which Kubernetes does not allow to change: a plain `helm upgrade` with `existingClaim` fails. Recreate the StatefulSet without touching the pod or its volume. The claim the template created is named `data-<fullname>-0`, e.g. `data-stalwart-0`. Here `<fullname>` is `stalwart` and the namespace `mail`:
+
+1. Back up the data store.
+2. Make sure deleting the StatefulSet cannot delete the claim. With `persistence.retentionPolicy.whenDeleted: Delete`, first upgrade with `Retain` (or remove the setting) and wait until the claim has no owner:
+
+   ```sh
+   kubectl -n mail get pvc data-stalwart-0 -o jsonpath='{.metadata.ownerReferences}'   # must print nothing
+   ```
+
+   If you also want to keep the volume when the claim itself is ever deleted, set its PersistentVolume's reclaim policy to `Retain`:
+
+   ```sh
+   kubectl patch pv "$(kubectl -n mail get pvc data-stalwart-0 -o jsonpath='{.spec.volumeName}')" \
+     -p '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}'
+   ```
+
+3. Delete only the StatefulSet object; the pod keeps running and the claim stays:
+
+   ```sh
+   kubectl -n mail delete statefulset stalwart --cascade=orphan
+   ```
+
+4. Upgrade with the claim, using the same values otherwise:
+
+   ```sh
+   helm upgrade stalwart oci://ghcr.io/s7n-systems/charts/stalwart --version 0.6.1 -n mail -f my-values.yaml \
+     --set persistence.existingClaim=data-stalwart-0
+   ```
+
+   The new StatefulSet adopts the running pod and replaces it once, now mounting the claim directly.
+
+The reverse direction, from `existingClaim` back to the claim template, needs the same recreation (steps 3 and 4 without the `--set`). The template adopts an existing claim only if it is named `data-<fullname>-0`.
+
 ## Chart 0.6.0: Bulwark 1.21.2, TLS from cert-manager, helm test
 
 Bulwark 1.21.2 fixes about 20 security advisories. Check these before upgrading:

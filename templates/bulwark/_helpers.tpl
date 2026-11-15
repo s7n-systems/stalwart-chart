@@ -145,12 +145,7 @@ true
 {{- if and .Values.webmail.autoscaling.enabled (not .Values.webmail.autoscaling.metrics) (not .Values.webmail.autoscaling.targetCPUUtilizationPercentage) (not .Values.webmail.autoscaling.targetMemoryUtilizationPercentage) -}}
 {{- fail "webmail.autoscaling.enabled requires targetCPUUtilizationPercentage, targetMemoryUtilizationPercentage, or metrics" -}}
 {{- end -}}
-{{- if and .Values.webmail.autoscaling.enabled .Values.webmail.autoscaling.targetCPUUtilizationPercentage (not (dig "requests" "cpu" false (.Values.webmail.resources | default dict))) -}}
-{{- fail "webmail.autoscaling.targetCPUUtilizationPercentage requires webmail.resources.requests.cpu" -}}
-{{- end -}}
-{{- if and .Values.webmail.autoscaling.enabled .Values.webmail.autoscaling.targetMemoryUtilizationPercentage (not (dig "requests" "memory" false (.Values.webmail.resources | default dict))) -}}
-{{- fail "webmail.autoscaling.targetMemoryUtilizationPercentage requires webmail.resources.requests.memory" -}}
-{{- end -}}
+{{- include "stalwart.validateAutoscalingRequests" (dict "prefix" "webmail." "autoscaling" .Values.webmail.autoscaling "resources" .Values.webmail.resources "sidecars" .Values.webmail.sidecars "initContainers" .Values.webmail.extraInitContainers) -}}
 {{- end -}}
 
 {{/* Environment generated from webmail values; merged with extraEnv/extraEnvVars by stalwart.mergeEnv. */}}
