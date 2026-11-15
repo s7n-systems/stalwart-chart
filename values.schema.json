@@ -2147,6 +2147,9 @@
         "tolerations": {
           "type": "array"
         },
+        "topologySpreadConstraints": {
+          "type": "array"
+        },
         "priorityClassName": {
           "type": "string"
         },
@@ -2355,6 +2358,9 @@
       "properties": {
         "enabled": {
           "type": "boolean"
+        },
+        "existingClaim": {
+          "type": "string"
         },
         "accessMode": {
           "type": "string"

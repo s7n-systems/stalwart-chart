@@ -1615,5 +1615,130 @@ class HelmTestScriptChecks(unittest.TestCase):
         self.assertIn('1 check(s) failed', output.getvalue())
 
 
+
+def render_notes(values=None):
+    """templates/NOTES.txt as installs print it. helm template skips NOTES.txt, so a copy of the
+    chart wraps it in a define and prints that from a template."""
+    import shutil
+    with tempfile.TemporaryDirectory() as directory:
+        chart = Path(directory) / 'stalwart'
+        shutil.copytree(ROOT, chart, ignore=shutil.ignore_patterns('.git', 'tests', '__pycache__', 'rendered*', 'dist', '.claude', '.codex', '.agents', '.qwen'))
+        notes = (chart / 'templates' / 'NOTES.txt').read_text()
+        (chart / 'templates' / '_notescheck.tpl').write_text('{{- define "notescheck" -}}\n' + notes + '\n{{- end -}}\n')
+        (chart / 'templates' / 'notescheck.yaml').write_text('notes: {{ include "notescheck" . | toJson }}\n')
+        settings = {'dataStore': {'backend': 'rocksdb'}, 'blobStore': {'backend': 'existing'}, 'logging': {'console': {'enabled': False}},
+                    'persistence': {'enabled': True}, **(values or {})}
+        (Path(directory) / 'values.yaml').write_text(yaml.safe_dump(settings))
+        result = subprocess.run(['helm', 'template', 'stalwart', str(chart), '--namespace', 'mail', '-f', str(Path(directory) / 'values.yaml'),
+                                 '--show-only', 'templates/notescheck.yaml'], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    return yaml.safe_load(result.stdout)['notes']
+
+
+class FollowUpChecks(unittest.TestCase):
+    def test_autoscaling_requests_on_every_container(self):
+        scaling = {'enabled': True, 'maxReplicas': 3, 'targetCPUUtilizationPercentage': 70}
+        multi = {'dataStore': {'backend': 'postgresql', 'postgresql': {'host': 'pg', 'existingSecret': 'pg'}},
+                 'coordinator': {'externallyManaged': True}, 'autoscaling': scaling}
+        requests = {'requests': {'cpu': '10m', 'memory': '16Mi'}}
+        sidecar = {'name': 'shipper', 'image': 'x'}
+        native = {'name': 'proxy', 'image': 'x', 'restartPolicy': 'Always'}
+        error = render({**multi, 'sidecars': [sidecar]}, succeeds=False)
+        self.assertIn('set requests.cpu (or limits.cpu) for sidecars shipper', error)
+        error = render({**multi, 'extraInitContainers': [native]}, succeeds=False)
+        self.assertIn('extraInitContainers proxy (a native sidecar)', error)
+        # Ordinary init containers finish before the pod runs; raw metrics replace the targets.
+        render({**multi, 'sidecars': [{**sidecar, 'resources': requests}], 'extraInitContainers': [{'name': 'seed', 'image': 'x'}, {**native, 'resources': requests}]})
+        render({**multi, 'sidecars': [sidecar], 'autoscaling': {**scaling, 'targetCPUUtilizationPercentage': None,
+                                                               'metrics': [{'type': 'Pods', 'pods': {'metric': {'name': 'connections'}, 'target': {'type': 'AverageValue', 'averageValue': '100'}}}]}})
+        error = render({**multi, 'sidecars': [{**sidecar, 'resources': {'requests': {'cpu': '1m'}}}],
+                        'autoscaling': {**scaling, 'targetMemoryUtilizationPercentage': 80}}, succeeds=False)
+        self.assertIn('set requests.memory (or limits.memory) for sidecars shipper', error)
+        # A limit alone counts: Kubernetes sets the request to the limit.
+        limited = {'limits': {'cpu': '100m', 'memory': '64Mi'}}
+        render({**multi, 'sidecars': [{**sidecar, 'resources': limited}], 'extraInitContainers': [{**native, 'resources': limited}],
+                'autoscaling': {**scaling, 'targetMemoryUtilizationPercentage': 80}})
+        render({**multi, 'resources': {'requests': None, 'limits': {'cpu': '1', 'memory': '1Gi'}}})
+        self.assertIn('set requests.cpu (or limits.cpu) for resources', render({**multi, 'resources': {'requests': {'cpu': None}}}, succeeds=False))
+        # The webmail, with its own prefix.
+        webmail = {'enabled': True, 'adminPassword': {'value': 'x'}, 'sessionSecret': {'existingSecret': 's'},
+                   'sharedStore': {'existingSecret': 'valkey'}, 'autoscaling': {'enabled': True, 'maxReplicas': 3}}
+        error = render({'webmail': {**webmail, 'sidecars': [sidecar]}}, succeeds=False)
+        self.assertIn('webmail.autoscaling scales on cpu', error)
+        self.assertIn('webmail.sidecars shipper', error)
+        render({'webmail': {**webmail, 'sidecars': [{**sidecar, 'resources': requests}]}})
+        render({'webmail': {**webmail, 'sidecars': [{**sidecar, 'resources': limited}], 'extraInitContainers': [{**native, 'resources': {'limits': {'cpu': '50m'}}}]}})
+        self.assertIn('webmail.extraInitContainers proxy (a native sidecar)', render({'webmail': {**webmail, 'extraInitContainers': [native]}}, succeeds=False))
+
+    def test_existing_claim(self):
+        docs = render({'persistence': {'enabled': True, 'existingClaim': 'restored', 'retentionPolicy': {'whenDeleted': 'Delete'}}})
+        statefulset = workload(docs)
+        self.assertNotIn('volumeClaimTemplates', statefulset['spec'])
+        self.assertNotIn('persistentVolumeClaimRetentionPolicy', statefulset['spec'])
+        self.assertIn({'name': 'data', 'persistentVolumeClaim': {'claimName': 'restored'}}, statefulset['spec']['template']['spec']['volumes'])
+        statefulset = workload(render({'persistence': {'enabled': True, 'retentionPolicy': {'whenDeleted': 'Delete'}}}))
+        self.assertEqual(statefulset['spec']['volumeClaimTemplates'][0]['metadata']['name'], 'data')
+        self.assertEqual(statefulset['spec']['persistentVolumeClaimRetentionPolicy'], {'whenDeleted': 'Delete'})
+        error = render({'dataStore': {'backend': 'postgresql', 'postgresql': {'host': 'pg', 'existingSecret': 'pg'}}, 'replicaCount': 2,
+                        'coordinator': {'externallyManaged': True}, 'persistence': {'enabled': True, 'existingClaim': 'restored'}}, succeeds=False)
+        self.assertIn('persistence.existingClaim supports one replica only', error)
+
+    def test_webmail_topology_spread(self):
+        spread = [{'maxSkew': 1, 'topologyKey': 'topology.kubernetes.io/zone', 'whenUnsatisfiable': 'ScheduleAnyway',
+                   'labelSelector': {'matchLabels': {'app.kubernetes.io/component': 'webmail'}}}]
+        deployment = next(d for d in render({'webmail': {'enabled': True, 'topologySpreadConstraints': spread}}) if d['kind'] == 'Deployment')
+        self.assertEqual(deployment['spec']['template']['spec']['topologySpreadConstraints'], spread)
+        deployment = next(d for d in render({'webmail': {'enabled': True}}) if d['kind'] == 'Deployment')
+        self.assertNotIn('topologySpreadConstraints', deployment['spec']['template']['spec'])
+
+    def test_notes(self):
+        notes = render_notes()
+        self.assertIn('Stalwart v', notes)
+        self.assertIn('port-forward svc/stalwart-management 8080:8080', notes)
+        self.assertIn('helm test stalwart --namespace mail', notes)
+        self.assertNotIn('WARNING', notes)
+        notes = render_notes({'recoveryMode': {'enabled': True}, 'recoveryAdmin': {'enabled': True, 'password': 'x'}})
+        self.assertIn('RECOVERY MODE', notes)
+        self.assertNotIn('Mail ports', notes)
+        self.assertNotIn('recoveryAdmin is still enabled', notes)
+        # The scheme follows the Ingress tls entries: exact, one-label wildcard, none.
+        ingress = {'domain': 'example.org', 'ingress': {'enabled': True, 'tls': [{'hosts': ['mail.example.org']}]},
+                   'webmail': {'enabled': True, 'ingress': {'enabled': True, 'tls': [{'hosts': ['*.example.org']}]}}}
+        notes = render_notes(ingress)
+        self.assertIn('https://mail.example.org/', notes)
+        self.assertIn('https://webmail.example.org/', notes)
+        notes = render_notes({'domain': 'example.org', 'ingress': {'enabled': True, 'hosts': [{'host': 'a.mail.example.org', 'paths': [{'path': '/', 'pathType': 'Prefix'}]}],
+                                                                   'tls': [{'hosts': ['*.example.org']}]}})
+        self.assertIn('http://a.mail.example.org/', notes)
+        notes = render_notes({'gatewayAPI': {'httpRoute': {'enabled': True, 'parentRefs': [{'name': 'gw'}], 'hostnames': ['mail.example.org']}}})
+        self.assertIn("mail.example.org\n  over the Gateway's listeners", notes)
+        self.assertNotIn('://mail.example.org', notes)
+        # Mail exposure hints.
+        self.assertIn('expose the mail ports with service.type', render_notes())
+        self.assertIn('get svc stalwart', render_notes({'service': {'type': 'LoadBalancer'}}))
+        self.assertNotIn('expose the mail ports', render_notes({'gatewayAPI': {'tcpRoutes': {'smtp': {'parentRefs': [{'name': 'gw'}]}}}}))
+        # TLS from cert-manager.
+        notes = render_notes({'hostname': 'mail.example.org', 'domain': 'example.org', 'provisioning': {'existingSecret': 'admin'},
+                              'tls': {'enabled': True, 'certManager': {'enabled': True, 'issuerRef': {'name': 'le'}}}})
+        self.assertIn('certificate in Secret stalwart-tls for mail.example.org', notes)
+        self.assertIn('get certificate stalwart', notes)
+        self.assertIn('logs job/stalwart-provisioning', notes)
+
+    def test_notes_warnings(self):
+        notes = render_notes({'persistence': {'enabled': False}, 'recoveryAdmin': {'enabled': True, 'existingSecret': 'admin'}})
+        self.assertIn('persistence.enabled is false', notes)
+        self.assertIn('recoveryAdmin is still enabled', notes)
+        self.assertNotIn('plain values', notes)
+        notes = render_notes({'provisioning': {'password': 'x'}, 'extraSecretEnv': {'TOKEN': 'y'},
+                              'blobStore': {'backend': 's3', 's3': {'bucket': 'b', 'accessKeyId': 'a', 'secretKey': 'b'}},
+                              'webmail': {'enabled': True, 'sharedStore': {'url': 'redis://valkey:6379', 'allowNoPassword': True}}})
+        warning = next(line for line in notes.splitlines() if 'plain values' in line)
+        for name in ('provisioning.password', 'extraSecretEnv', 'blobStore.s3.accessKeyId/secretKey', 'webmail.sharedStore.url'):
+            self.assertIn(name, warning)
+        self.assertIn('allowNoPassword is set', notes)
+        # Webmail values of a disabled webmail are not in use.
+        self.assertNotIn('plain values', render_notes({'webmail': {'adminPassword': {'value': 'x'}}}))
+
+
 if __name__ == '__main__':
     unittest.main()

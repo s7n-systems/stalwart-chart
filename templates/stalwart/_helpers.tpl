@@ -69,6 +69,36 @@ true
 {{- $scheme -}}
 {{- end -}}
 
+{{/* Utilization targets are relative to the requests of every container that runs in the pod:
+     the main container, sidecars and native sidecars (init containers with restartPolicy Always).
+     Without one, the HPA cannot compute the utilization and does not scale. A limit without a
+     request counts, since Kubernetes then sets the request to the limit. Raw metrics replace the
+     targets and are not checked. */}}
+{{- define "stalwart.validateAutoscalingRequests" -}}
+{{- $a := .autoscaling -}}
+{{- if and $a.enabled (not $a.metrics) -}}
+{{- $containers := list (dict "name" (printf "%sresources" .prefix) "resources" .resources) -}}
+{{- range .sidecars -}}
+{{- $containers = append $containers (dict "name" (printf "%ssidecars %s" $.prefix (toString .name)) "resources" .resources) -}}
+{{- end -}}
+{{- range .initContainers -}}
+{{- if eq (toString .restartPolicy) "Always" -}}
+{{- $containers = append $containers (dict "name" (printf "%sextraInitContainers %s (a native sidecar)" $.prefix (toString .name)) "resources" .resources) -}}
+{{- end -}}
+{{- end -}}
+{{- range $resource, $target := dict "cpu" $a.targetCPUUtilizationPercentage "memory" $a.targetMemoryUtilizationPercentage -}}
+{{- if $target -}}
+{{- range $containers -}}
+{{- $r := .resources | default dict -}}
+{{- if not (or (dig "requests" $resource "" $r) (dig "limits" $resource "" $r)) -}}
+{{- fail (printf "%sautoscaling scales on %s use relative to the requests of every container in the pod: set requests.%s (or limits.%s) for %s" $.prefix $resource $resource $resource .name) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "stalwart.managementPort" -}}
 {{- if .Values.recoveryMode.enabled -}}
 {{- .Values.recoveryMode.port -}}
@@ -161,12 +191,7 @@ maxUnavailable: {{ .maxUnavailable }}
 {{- if and .Values.autoscaling.enabled (not .Values.autoscaling.metrics) (not .Values.autoscaling.targetCPUUtilizationPercentage) (not .Values.autoscaling.targetMemoryUtilizationPercentage) -}}
 {{- fail "autoscaling.enabled requires targetCPUUtilizationPercentage, targetMemoryUtilizationPercentage, or metrics" -}}
 {{- end -}}
-{{- if and .Values.autoscaling.enabled .Values.autoscaling.targetCPUUtilizationPercentage (not (dig "requests" "cpu" false (.Values.resources | default dict))) -}}
-{{- fail "autoscaling.targetCPUUtilizationPercentage requires resources.requests.cpu" -}}
-{{- end -}}
-{{- if and .Values.autoscaling.enabled .Values.autoscaling.targetMemoryUtilizationPercentage (not (dig "requests" "memory" false (.Values.resources | default dict))) -}}
-{{- fail "autoscaling.targetMemoryUtilizationPercentage requires resources.requests.memory" -}}
-{{- end -}}
+{{- include "stalwart.validateAutoscalingRequests" (dict "prefix" "" "autoscaling" .Values.autoscaling "resources" .Values.resources "sidecars" .Values.sidecars "initContainers" .Values.extraInitContainers) -}}
 {{- if and .Values.ingress.enabled (ne .Values.ingress.backend "management") (not .Values.service.enabled) -}}
 {{- fail "ingress.enabled requires service.enabled, or ingress.backend management" -}}
 {{- end -}}
@@ -208,6 +233,9 @@ maxUnavailable: {{ .maxUnavailable }}
 {{- end -}}
 {{- if and .Values.hostname (not (.Values.mailDomain | default .Values.domain)) -}}
 {{- fail "hostname requires mailDomain (or domain): Stalwart needs a default domain with the hostname" -}}
+{{- end -}}
+{{- if and .Values.persistence.enabled .Values.persistence.existingClaim (gt (int (include "stalwart.effectiveMaxReplicas" .)) 1) -}}
+{{- fail "persistence.existingClaim supports one replica only: every pod would mount the same claim. Use the claim template for several replicas" -}}
 {{- end -}}
 {{- if and .Values.tls.enabled (not .Values.hostname) -}}
 {{- fail "tls.enabled requires hostname: Stalwart only accepts a default certificate together with its default hostname" -}}

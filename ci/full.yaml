@@ -51,6 +51,20 @@ ingress:
   tls:
     - secretName: "mail-tls"
       hosts: ["mail.example.org"]
+# Routes on a Gateway next to the Ingress, so their CRD schemas are checked too.
+gatewayAPI:
+  httpRoute:
+    enabled: true
+    parentRefs:
+      - name: "mail-gateway"
+        namespace: "gateway"
+    hostnames: ["mail.example.org"]
+  tcpRoutes:
+    smtp:
+      parentRefs:
+        - name: "mail-gateway"
+          namespace: "gateway"
+          sectionName: "smtp"
 podAntiAffinityPreset: "soft"
 networkPolicy:
   enabled: true

@@ -102,7 +102,7 @@ Copy the example to `my-values.yaml`, set the database host, bucket, `hostname` 
 
 ```sh
 helm upgrade --install stalwart oci://ghcr.io/s7n-systems/charts/stalwart \
-  --version 0.6.0 --namespace stalwart -f my-values.yaml --timeout 15m
+  --version 0.6.1 --namespace stalwart -f my-values.yaml --timeout 15m
 ```
 
 The chart validates required storage settings and credential references before rendering. It cannot check whether referenced Secrets exist or whether external services are reachable; these failures can still leave an incomplete installation. To install from a checkout instead, use `.` as the chart: Bitnami Common is vendored in `charts/`, so no dependency download is needed.
@@ -112,7 +112,7 @@ The chart validates required storage settings and credential references before r
 Release builds are signed keylessly with cosign 3 from this repository's release workflow. Cosign 3 stores the signature as an OCI referrer in the new bundle format; verify with cosign 3 or newer (cosign 2 reports "no signatures found"):
 
 ```sh
-cosign verify ghcr.io/s7n-systems/charts/stalwart:0.6.0 \
+cosign verify ghcr.io/s7n-systems/charts/stalwart:0.6.1 \
   --certificate-identity-regexp '^https://github\.com/s7n-systems/stalwart-chart/\.github/workflows/release\.yml@' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
@@ -122,7 +122,7 @@ cosign verify ghcr.io/s7n-systems/charts/stalwart:0.6.0 \
 For an interactive first-time setup, use recovery mode, which suspends mail services and opens only the management listener. You can instead provision domains and other settings through `provisioning.extraPlan` during a normal installation.
 
 ```sh
-helm upgrade --install stalwart oci://ghcr.io/s7n-systems/charts/stalwart --version 0.6.0 \
+helm upgrade --install stalwart oci://ghcr.io/s7n-systems/charts/stalwart --version 0.6.1 \
   --namespace stalwart -f my-values.yaml --set recoveryMode.enabled=true --timeout 15m
 kubectl --namespace stalwart port-forward svc/stalwart-management 8080:8080
 ```
@@ -160,7 +160,7 @@ The top-level `existingSecret` is loaded into the server's environment with `env
 
 ### Storage
 
-`dataStore.backend` selects `postgresql` (default) or `rocksdb`. A non-empty `config` object replaces this with a raw startup configuration for other backends. RocksDB and SQLite data stores need persistent storage and cannot run with more than one replica. The chart defaults to `persistence.enabled: false`; enable it for a local database. Custom local paths must match the mounted data volume (`/var/lib/stalwart`) or use additional volumes.
+`dataStore.backend` selects `postgresql` (default) or `rocksdb`. A non-empty `config` object replaces this with a raw startup configuration for other backends. RocksDB and SQLite data stores need persistent storage and cannot run with more than one replica. The chart defaults to `persistence.enabled: false`; enable it for a local database. `persistence.existingClaim` mounts an existing claim instead of the StatefulSet's claim template, for example to restore or adopt a RocksDB volume; it allows one replica only. Switching a running release to it means recreating the StatefulSet, since its claim template cannot change; see [Upgrading](docs/upgrading.md#switching-a-running-release-to-persistenceexistingclaim). Custom local paths must match the mounted data volume (`/var/lib/stalwart`) or use additional volumes.
 
 `blobStore.backend: s3` stores messages in a bucket. Use Stalwart's region names such as `EuCentral1`; for MinIO, SeaweedFS or another S3-compatible service set `custom.url` and `custom.region`. Only static access keys are supported. `blobStore.backend: existing` leaves blob storage as configured elsewhere.
 
@@ -592,7 +592,7 @@ NATS is recommended for most clusters (plain pub/sub, no JetStream); `redis`, `k
 | `priorityClassName` | Empty. Set a PriorityClass so mail pods are scheduled, and kept, before less important workloads. |
 | `persistence.retentionPolicy` | Empty, which keeps the volumes when the StatefulSet is deleted or scaled down. `whenScaled: Delete` removes the volumes of removed replicas. |
 
-`role` and `pushShard` apply to every pod of a release; install several releases for different roles. Bulwark has its own `webmail.autoscaling` and `webmail.pdb`.
+`role` and `pushShard` apply to every pod of a release; install several releases for different roles. Bulwark has its own `webmail.autoscaling`, `webmail.pdb` and `webmail.topologySpreadConstraints`. CPU and memory targets are relative to the requests of every container in the pod, so the chart requires those requests on sidecars and native sidecars (`extraInitContainers` with `restartPolicy: Always`) too.
 
 ### Security
 
@@ -635,7 +635,7 @@ See [Upgrading](docs/upgrading.md) before changing application versions.
 - **Names:** keep the release name and `fullnameOverride` stable; volume claims are tied to them.
 - **Resources:** the default requests (100m CPU, 512 MiB) suit a small installation. There is no CPU limit, to avoid throttling mail processing.
 - **Sidecars:** `sidecars` and `webmail.sidecars` add containers as written, e.g. a log shipper. They must meet the same pod security settings as the chart's containers to pass the [Kyverno policies](policies/kyverno).
-- **Tests:** `helm test <release>` runs a pod that checks the management endpoint, then for each port in `service.ports` connects, completes the TLS handshake on implicit-TLS ports and reads the protocol greeting (by port name: `smtp`, `smtps`, `submission`, `imap`, `imaps`, `pop3`, `pop3s`, `sieve`, `https`; other names only connect), and the webmail's `/api/health`. It does not verify the certificate. Helm deletes the pod after a successful run; a failed one stays for `kubectl logs <fullname>-test` until the next run. Installs, upgrades and syncs never run it: only `helm test` or `helmfile test` do, and Argo CD skips test hooks entirely. Disable it with `tests.enabled: false`.
+- **Tests:** `helm test <release>` runs a pod that checks the management endpoint, then for each port in `service.ports` connects, completes the TLS handshake on implicit-TLS ports and reads the protocol greeting (by port name: `smtp`, `smtps`, `submission`, `imap`, `imaps`, `pop3`, `pop3s`, `sieve`, `https`; other names only connect), and the webmail's `/api/health`. It does not verify the certificate. The checks go through the Services, so each reaches one ready pod, not every replica; for per-pod health rely on the readiness probes. Helm deletes the pod after a successful run; a failed one stays for `kubectl logs <fullname>-test` until the next run. Installs, upgrades and syncs never run it: only `helm test` or `helmfile test` do, and Argo CD skips test hooks entirely. Disable it with `tests.enabled: false`.
 
 ### Before production
 
@@ -648,11 +648,12 @@ Run the CI checks locally (Helm, Python and Docker required):
 ```sh
 pip install --require-hashes -r ci/requirements.txt
 scripts/render-matrix.sh            # helm lint and render ci/*.yaml and the example
-scripts/validate-manifests.sh       # kubeconform and the Kyverno policies
-python3 tests/render.py             # template unit tests
+scripts/validate-manifests.sh       # kubeconform (Kubernetes 1.27 and 1.37, CRD schemas) and the Kyverno policies
+python3 tests/render.py             # template, NOTES.txt and helm test script unit tests
 python3 tests/test_reconcile.py     # reconciliation unit tests (no services required)
+python3 tests/test_e2e_harness.py   # parts of the kind suite, without a cluster
 tests/e2e/run.sh                    # reconcile Job against Stalwart and a k3s API server (Docker)
-tests/e2e/kind.sh                   # the chart in a kind cluster: hooks, restart, RBAC, a consumer that logs in
+tests/e2e/kind.sh                   # the chart in a kind cluster: hooks, restart, RBAC, helm test, a consumer that logs in
 yamllint -c .yamllint.yaml .
 scripts/generate-docs.sh --check    # README is current
 ```
@@ -835,7 +836,8 @@ Bitnami Common is vendored in `charts/` and updated by Renovate together with `C
 | pdb.minAvailable | string | `""` | Pods that must stay available, as a number or percentage. Replaces maxUnavailable when set; a value equal to the replica count blocks drains. |
 | persistence.accessMode | string | `"ReadWriteOnce"` |  |
 | persistence.enabled | bool | `false` | Disabled for external PostgreSQL/S3; enable for local durable stores. |
-| persistence.retentionPolicy | object | `{}` | StatefulSet persistentVolumeClaimRetentionPolicy: whenDeleted and whenScaled, each Retain or Delete. Empty keeps Kubernetes' default, Retain for both. |
+| persistence.existingClaim | string | `""` | Mount an existing claim instead of the StatefulSet's claim template, e.g. to restore or adopt a RocksDB volume. One replica only, since every pod would mount the same claim. |
+| persistence.retentionPolicy | object | `{}` | StatefulSet persistentVolumeClaimRetentionPolicy: whenDeleted and whenScaled, each Retain or Delete. Empty keeps Kubernetes' default, Retain for both. Applies only to claims the StatefulSet creates from its template, not to existingClaim. |
 | persistence.size | string | `"20Gi"` |  |
 | persistence.storageClass | string | `""` | Empty uses the cluster default; "-" explicitly requests no storage class. |
 | podAnnotations | object | `{}` | Extra annotations on the mail pods. `checksum/config` and `checksum/secret` are reserved. |
@@ -1101,6 +1103,7 @@ Bitnami Common is vendored in `charts/` and updated by Renovate together with `C
 | webmail.strategy | object | `{}` | Deployment strategy. Empty uses Recreate with a ReadWriteOnce volume, which a new pod cannot attach while the old one holds it, and RollingUpdate otherwise. |
 | webmail.telemetry.enabled | bool | `true` |  |
 | webmail.tolerations | list | `[]` |  |
+| webmail.topologySpreadConstraints | list | `[]` | Topology spread constraints for the webmail pods, e.g. across zones; podAntiAffinityPreset only covers nodes. |
 | webmail.trustedProxyDepth | int | `1` | Reverse proxies in front of the pods that append X-Forwarded-For: 1 for an ingress controller or Gateway alone, 2 with a cloud load balancer in front of it. Sign-in limits and the audit log use the client address this selects. |
 
 </details>
