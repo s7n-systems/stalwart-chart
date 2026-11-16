@@ -1,5 +1,12 @@
 # Upgrading
 
+## Chart 0.6.2: Stalwart 1.1.1
+
+No steps are needed for the chart. Stalwart 1.1.1:
+
+- **Masked email addresses** no longer need an Enterprise license. Bulwark 1.21.2 detects them and lists them under Settings > Security, where users create, describe, disable and delete them. Mail to an active masked address is delivered to its account.
+- **Security fixes:** IMAP request memory limits, a sandboxing `Content-Security-Policy` for WebDAV file downloads, and queued messages visible only to the sender's tenant. See the [release notes](https://github.com/stalwartlabs/stalwart/releases/tag/v1.1.1).
+
 ## Chart 0.6.1: autoscaling checks, existingClaim
 
 No steps are needed, except in one case: CPU and memory autoscaling (`autoscaling` or `webmail.autoscaling` with a utilization target) now requires `resources.requests` for that resource on every sidecar and native sidecar (`extraInitContainers` with `restartPolicy: Always`). Rendering fails without them. Such a configuration never scaled: Kubernetes cannot compute the utilization when a container in the pod lacks the request. Add the requests, or scale on raw `metrics`.
