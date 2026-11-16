@@ -67,7 +67,7 @@ The chart deploys Stalwart 1.0 as a StatefulSet and configures it the way Stalwa
 | **Security** | Non-root, read-only root filesystem, all capabilities dropped except `NET_BIND_SERVICE`, no ServiceAccount token in the Stalwart and webmail pods, images pinned by digest, optional NetworkPolicies and Kyverno policies |
 | **Observability** | Prometheus exporter with optional Basic authentication and ServiceMonitor; logs to stdout; `helm test` checks every mail port |
 | **Certificates** | Default certificate from a Secret or a cert-manager Certificate, registered in Stalwart and reloaded on a schedule without restarting pods |
-| **Webmail** | Bulwark JMAP webmail with OAuth/OIDC login, branding (logos, colours, login page), its own autoscaling, PDB and persistence |
+| **Webmail** | Bulwark JMAP webmail with OAuth/OIDC login, masked email addresses, branding (logos, colours, login page), its own autoscaling, PDB and persistence |
 | **Supply chain** | Chart published to GHCR as an OCI artifact and signed with cosign; Renovate keeps images, actions and tools current |
 
 ## Requirements
@@ -102,7 +102,7 @@ Copy the example to `my-values.yaml`, set the database host, bucket, `hostname` 
 
 ```sh
 helm upgrade --install stalwart oci://ghcr.io/s7n-systems/charts/stalwart \
-  --version 0.6.1 --namespace stalwart -f my-values.yaml --timeout 15m
+  --version 0.6.2 --namespace stalwart -f my-values.yaml --timeout 15m
 ```
 
 The chart validates required storage settings and credential references before rendering. It cannot check whether referenced Secrets exist or whether external services are reachable; these failures can still leave an incomplete installation. To install from a checkout instead, use `.` as the chart: Bitnami Common is vendored in `charts/`, so no dependency download is needed.
@@ -112,7 +112,7 @@ The chart validates required storage settings and credential references before r
 Release builds are signed keylessly with cosign 3 from this repository's release workflow. Cosign 3 stores the signature as an OCI referrer in the new bundle format; verify with cosign 3 or newer (cosign 2 reports "no signatures found"):
 
 ```sh
-cosign verify ghcr.io/s7n-systems/charts/stalwart:0.6.1 \
+cosign verify ghcr.io/s7n-systems/charts/stalwart:0.6.2 \
   --certificate-identity-regexp '^https://github\.com/s7n-systems/stalwart-chart/\.github/workflows/release\.yml@' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
@@ -122,7 +122,7 @@ cosign verify ghcr.io/s7n-systems/charts/stalwart:0.6.1 \
 For an interactive first-time setup, use recovery mode, which suspends mail services and opens only the management listener. You can instead provision domains and other settings through `provisioning.extraPlan` during a normal installation.
 
 ```sh
-helm upgrade --install stalwart oci://ghcr.io/s7n-systems/charts/stalwart --version 0.6.1 \
+helm upgrade --install stalwart oci://ghcr.io/s7n-systems/charts/stalwart --version 0.6.2 \
   --namespace stalwart -f my-values.yaml --set recoveryMode.enabled=true --timeout 15m
 kubectl --namespace stalwart port-forward svc/stalwart-management 8080:8080
 ```
@@ -429,7 +429,7 @@ Secret lifecycle:
 
 ### Webmail
 
-Bulwark is off by default. Set a browser-accessible JMAP URL. Explicit session and administrator secrets keep admin sessions and credentials stable across pod replacements; both are required by the chart for multiple replicas:
+Bulwark is off by default. Besides mail, calendars and contacts, it lets users manage Stalwart's masked email addresses under Settings > Security (Stalwart 1.1.1 or later, also in the open source edition). Set a browser-accessible JMAP URL. Explicit session and administrator secrets keep admin sessions and credentials stable across pod replacements; both are required by the chart for multiple replicas:
 
 ```yaml
 webmail:
