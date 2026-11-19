@@ -191,7 +191,11 @@ maxUnavailable: {{ .maxUnavailable }}
 {{- if and .Values.autoscaling.enabled (not .Values.autoscaling.metrics) (not .Values.autoscaling.targetCPUUtilizationPercentage) (not .Values.autoscaling.targetMemoryUtilizationPercentage) -}}
 {{- fail "autoscaling.enabled requires targetCPUUtilizationPercentage, targetMemoryUtilizationPercentage, or metrics" -}}
 {{- end -}}
-{{- include "stalwart.validateAutoscalingRequests" (dict "prefix" "" "autoscaling" .Values.autoscaling "resources" .Values.resources "sidecars" .Values.sidecars "initContainers" .Values.extraInitContainers) -}}
+{{- $sidecars := .Values.sidecars | default list -}}
+{{- if .Values.adminAccount.enabled -}}
+{{- $sidecars = append $sidecars (dict "name" "admin-gateway" "resources" .Values.adminAccount.gateway.resources) -}}
+{{- end -}}
+{{- include "stalwart.validateAutoscalingRequests" (dict "prefix" "" "autoscaling" .Values.autoscaling "resources" .Values.resources "sidecars" $sidecars "initContainers" .Values.extraInitContainers) -}}
 {{- if and .Values.ingress.enabled (ne .Values.ingress.backend "management") (not .Values.service.enabled) -}}
 {{- fail "ingress.enabled requires service.enabled, or ingress.backend management" -}}
 {{- end -}}
@@ -210,7 +214,7 @@ maxUnavailable: {{ .maxUnavailable }}
 {{- if and .Values.enterprise.apiKey.existingSecret .Values.enterprise.licenseKey.existingSecret -}}
 {{- fail "enterprise.apiKey and enterprise.licenseKey are exclusive: with the API key Stalwart renews and stores the license itself, which a fixed licenseKey would overwrite on every upgrade" -}}
 {{- end -}}
-{{- if and (eq (include "stalwart.cliCredentialsNeeded" .) "true") (not .Values.provisioning.existingSecret) (not .Values.provisioning.password) -}}
+{{- if and (eq (include "stalwart.cliCredentialsNeeded" .) "true") (not .Values.adminAccount.enabled) (not .Values.provisioning.existingSecret) (not .Values.provisioning.password) -}}
 {{- fail "provisioning.existingSecret or provisioning.password is required when S3 blob-store, metrics, encryption, blob compression, enterprise, OIDC or extra provisioning, console logging, certificateReload or tls is enabled" -}}
 {{- end -}}
 {{- if and (eq .Values.coordinator.type "nats") (not .Values.coordinator.nats.hosts) -}}
@@ -254,6 +258,7 @@ maxUnavailable: {{ .maxUnavailable }}
 {{- end -}}
 {{- include "stalwart.validateWebmail" . -}}
 {{- include "stalwart.validateSystemAccounts" . -}}
+{{- include "stalwart.validateAdminAccount" . -}}
 {{- end -}}
 
 {{/* True when a chart-managed credentials Secret is needed for any plain-value fallback. */}}
@@ -263,7 +268,7 @@ maxUnavailable: {{ .maxUnavailable }}
   .Values.extraSecretEnv
   (and (not .Values.config) (eq .Values.dataStore.backend "postgresql") (not (default .Values.existingSecret .Values.dataStore.postgresql.existingSecret)) .Values.dataStore.postgresql.password)
   (and (eq .Values.blobStore.backend "s3") (not .Values.blobStore.s3.existingSecret) .Values.blobStore.s3.accessKeyId .Values.blobStore.s3.secretKey)
-  (and (eq (include "stalwart.cliCredentialsNeeded" .) "true") (not .Values.provisioning.existingSecret) .Values.provisioning.password)
+  (and (eq (include "stalwart.cliCredentialsNeeded" .) "true") (not .Values.adminAccount.enabled) (not .Values.provisioning.existingSecret) .Values.provisioning.password)
   (and .Values.metrics.enabled (not .Values.metrics.auth.existingSecret) .Values.metrics.auth.password)
   (and (eq .Values.coordinator.type "nats") (not .Values.coordinator.nats.existingSecret) .Values.coordinator.nats.password)
 -}}
@@ -463,17 +468,138 @@ Helm chart blob key
 {{- join "\n" $lines -}}
 {{- end -}}
 
-{{/* Namespaces with Secrets of system accounts: {"<namespace>": ["<secret>", ...]}. */}}
+{{/* Namespaces with the Secrets the reconcile Job writes (system accounts, the administrator
+     account and its clients): {"<namespace>": ["<secret>", ...]}. */}}
 {{- define "stalwart.systemAccountSecrets" -}}
 {{- $scopes := dict -}}
-{{- range (include "stalwart.systemAccounts" . | fromJson).accounts -}}
+{{- $admin := include "stalwart.adminAccount" . | fromJson -}}
+{{- $accounts := concat (include "stalwart.systemAccounts" . | fromJson).accounts ($admin.clients | default list) -}}
+{{- if .Values.adminAccount.enabled -}}
+{{- $accounts = append $accounts $admin -}}
+{{- end -}}
+{{- range $accounts -}}
 {{- $_ := set $scopes .secret.namespace (append (get $scopes .secret.namespace | default list) .secret.name | uniq) -}}
 {{- end -}}
 {{- $scopes | toJson -}}
 {{- end -}}
 
+{{/* Administrator account (adminAccount) as JSON, for the RBAC and the reconcile Job: the
+     account, the Secret of the Jobs' app password, and the clients as system account entries
+     of the same account. Its app passwords are accepted from the loopback addresses only. */}}
+{{- define "stalwart.adminAccount" -}}
+{{- $a := .Values.adminAccount -}}
+{{- $loopback := list "127.0.0.1" "::1" -}}
+{{- $address := printf "%s@%s" $a.name $a.domain -}}
+{{- $clients := list -}}
+{{- range $a.clients -}}
+{{- $clients = append $clients (dict
+  "id" (printf "admin-%s" .id)
+  "name" $a.name
+  "address" $address
+  "appPassword" (dict "allowedIps" $loopback "permissions" (dict "@type" "Inherit"))
+  "secret" (dict "create" (dig "secret" "create" true .) "name" .secret.name "namespace" (dig "secret" "namespace" "" . | default $.Release.Namespace) "keys" (dig "secret" "keys" list . | default (list "password")))
+) -}}
+{{- end -}}
+{{- dict
+  "name" $a.name
+  "domain" $a.domain
+  "address" $address
+  "allowedIps" $loopback
+  "secret" (dict "name" (include "stalwart.adminSecretName" .) "namespace" .Release.Namespace)
+  "clients" $clients
+  | toJson -}}
+{{- end -}}
+
+{{- define "stalwart.adminSecretName" -}}
+{{- printf "%s-admin-account" (include "stalwart.fullname" .) -}}
+{{- end -}}
+
+{{/* URL of Stalwart for the chart's Jobs: the administrator account's gateway, else the
+     management Service. */}}
+{{- define "stalwart.jobsUrl" -}}
+{{- if .Values.adminAccount.enabled -}}
+{{- printf "http://%s-admin:%v" (include "stalwart.fullname" .) .Values.adminAccount.gateway.port -}}
+{{- else -}}
+{{- printf "http://%s-management:%v" (include "stalwart.fullname" .) .Values.management.servicePort -}}
+{{- end -}}
+{{- end -}}
+
+{{/* STALWART_USER and STALWART_PASSWORD of the chart's Jobs. */}}
+{{- define "stalwart.jobsCredentials" -}}
+{{- if .Values.adminAccount.enabled -}}
+- name: STALWART_USER
+  value: {{ printf "%s@%s" .Values.adminAccount.name .Values.adminAccount.domain | quote }}
+- name: STALWART_PASSWORD
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "stalwart.adminSecretName" . | quote }}
+      key: password
+{{- else -}}
+- name: STALWART_USER
+  value: {{ .Values.provisioning.username | quote }}
+- name: STALWART_PASSWORD
+  valueFrom:
+    secretKeyRef:
+      {{- if .Values.provisioning.existingSecret }}
+      name: {{ .Values.provisioning.existingSecret | quote }}
+      key: {{ .Values.provisioning.passwordSecretKey | quote }}
+      {{- else }}
+      name: {{ include "stalwart.fullname" . }}-env
+      key: provisioningPassword
+      {{- end }}
+{{- end -}}
+{{- end -}}
+
+{{- define "stalwart.validateAdminAccount" -}}
+{{- $a := .Values.adminAccount -}}
+{{- if $a.enabled -}}
+{{- if .Values.recoveryAdmin.enabled -}}
+{{- fail "adminAccount and recoveryAdmin are exclusive: the administrator account replaces the static recovery administrator (its bootstrap starts Stalwart with a temporary one)" -}}
+{{- end -}}
+{{- if not (and $a.name $a.domain) -}}
+{{- fail "adminAccount.name and adminAccount.domain are required" -}}
+{{- end -}}
+{{- if has $a.domain (list .Values.mailDomain .Values.domain) -}}
+{{- fail "adminAccount.domain must not be a mail domain: users of the directory (OIDC) could then map to the account" -}}
+{{- end -}}
+{{- if eq (toString $a.gateway.port) (toString (include "stalwart.managementPort" .)) -}}
+{{- fail "adminAccount.gateway.port must differ from the management port" -}}
+{{- end -}}
+{{- range .Values.systemAccounts.accounts -}}
+{{- if eq .name $a.name -}}
+{{- fail (printf "adminAccount.name %q is also a system account" $a.name) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $ids := list -}}
+{{- $secrets := list -}}
+{{- range .Values.systemAccounts.accounts -}}
+{{- $secrets = append $secrets (printf "%s/%s" (dig "secret" "namespace" "" . | default $.Release.Namespace) .secret.name) -}}
+{{- end -}}
+{{- if $a.enabled -}}
+{{- $secrets = append $secrets (printf "%s/%s" .Release.Namespace (include "stalwart.adminSecretName" .)) -}}
+{{- end -}}
+{{- range $a.clients -}}
+{{- if not $a.enabled -}}
+{{- fail "adminAccount.clients requires adminAccount.enabled" -}}
+{{- end -}}
+{{- if has .id $ids -}}
+{{- fail (printf "adminAccount.clients: id %q is used twice" .id) -}}
+{{- end -}}
+{{- $ids = append $ids .id -}}
+{{- if not (dig "secret" "name" "" .) -}}
+{{- fail (printf "adminAccount.clients[%s].secret.name is required" .id) -}}
+{{- end -}}
+{{- $secret := printf "%s/%s" (dig "secret" "namespace" "" . | default $.Release.Namespace) .secret.name -}}
+{{- if has $secret $secrets -}}
+{{- fail (printf "adminAccount.clients[%s]: Secret %s is used by another account" .id $secret) -}}
+{{- end -}}
+{{- $secrets = append $secrets $secret -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "stalwart.validateSystemAccounts" -}}
-{{- if eq (include "stalwart.provisioningEnabled" .) "true" -}}
+{{- if eq (include "stalwart.reconcileEnabled" .) "true" -}}
 {{- if eq .Values.updateStrategy.type "OnDelete" -}}
 {{- fail "updateStrategy.type OnDelete: the reconcile Job applies settings by a rolling restart of the StatefulSet, which OnDelete never performs; use RollingUpdate" -}}
 {{- end -}}
@@ -504,6 +630,14 @@ Helm chart blob key
 {{- fail (printf "systemAccounts.accounts[%s]: Secret %s is used by another account" .id $secret) -}}
 {{- end -}}
 {{- $secrets = append $secrets $secret -}}
+{{- end -}}
+{{- end -}}
+
+{{/* True when the reconcile Job and its RBAC are rendered: with provisioning, or for the
+     administrator account's bootstrap. */}}
+{{- define "stalwart.reconcileEnabled" -}}
+{{- if or (eq (include "stalwart.provisioningEnabled" .) "true") .Values.adminAccount.enabled -}}
+true
 {{- end -}}
 {{- end -}}
 

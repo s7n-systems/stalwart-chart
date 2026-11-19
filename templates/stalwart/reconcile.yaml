@@ -1,9 +1,10 @@
-{{- if eq (include "stalwart.provisioningEnabled" .) "true" }}
+{{- if eq (include "stalwart.reconcileEnabled" .) "true" }}
 {{- $fullname := include "stalwart.fullname" . }}
 {{- $name := printf "%s-reconcile" $fullname }}
 {{- $accounts := (include "stalwart.systemAccounts" . | fromJson).accounts }}
 {{- $secrets := include "stalwart.systemAccountSecrets" . | fromJson }}
-{{- range $accounts }}
+{{- $admin := include "stalwart.adminAccount" . | fromJson }}
+{{- range concat $accounts ($admin.clients | default list) }}
 {{- if .secret.create }}
 {{/* Declared without data: the reconcile Job is the only writer of the credential, and Helm
      leaves data it does not declare alone. Removed with the release like any other resource:
@@ -20,6 +21,21 @@ metadata:
     app.kubernetes.io/component: system-accounts
 type: Opaque
 {{- end }}
+{{- end }}
+{{- if .Values.adminAccount.enabled }}
+{{/* The administrator account's app password for the Jobs, and during a bootstrap the temporary
+     recovery administrator (STALWART_RECOVERY_ADMIN, read by Stalwart). Declared without data
+     like the Secrets above: only the bootstrap Job writes it. */}}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $admin.secret.name | quote }}
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "stalwart.labels" . | nindent 4 }}
+    app.kubernetes.io/component: admin-account
+type: Opaque
 {{- end }}
 ---
 apiVersion: v1
@@ -90,7 +106,8 @@ data:
     {{- $check := .Values.systemAccounts.smtpCheck }}
     {{- dict
       "release" .Release.Name
-      "stalwartUrl" (printf "http://%s-management:%v" $fullname .Values.management.servicePort)
+      "stalwartUrl" (include "stalwart.jobsUrl" .)
+      "adminAccount" (ternary $admin nil .Values.adminAccount.enabled)
       "lockTimeoutSeconds" (int .Values.provisioning.reconcile.activeDeadlineSeconds)
       "restart" (dict "namespace" .Release.Namespace "statefulset" $fullname "settingsHash" (include "stalwart.settingsPlan" . | sha256sum) "timeoutSeconds" (int .Values.provisioning.reconcile.restartTimeoutSeconds))
       "blobKey" (ternary (dict "description" (include "stalwart.blobKeyDescription" .) "email" .Values.encryption.blobKey.email "fileStorage" .Values.encryption.blobKey.fileStorage) nil (not (empty .Values.encryption.blobKey.existingSecret)))
@@ -163,18 +180,7 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: "metadata.labels['batch.kubernetes.io/controller-uid']"
-            - name: STALWART_USER
-              value: {{ .Values.provisioning.username | quote }}
-            - name: STALWART_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  {{- if .Values.provisioning.existingSecret }}
-                  name: {{ .Values.provisioning.existingSecret | quote }}
-                  key: {{ .Values.provisioning.passwordSecretKey | quote }}
-                  {{- else }}
-                  name: {{ $fullname }}-env
-                  key: provisioningPassword
-                  {{- end }}
+            {{- include "stalwart.jobsCredentials" . | nindent 12 }}
           resources:
             {{- toYaml .Values.provisioning.reconcile.resources | nindent 12 }}
           volumeMounts:
@@ -203,4 +209,99 @@ spec:
                       path: ca.crt
         - name: tmp
           emptyDir: {}
+{{- if .Values.adminAccount.enabled }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $fullname }}-admin-bootstrap
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "stalwart.labels" . | nindent 4 }}
+    app.kubernetes.io/component: admin-bootstrap
+  annotations:
+    {{- with (omit .Values.additionalAnnotations "helm.sh/hook" "helm.sh/hook-weight" "helm.sh/hook-delete-policy" "argocd.argoproj.io/hook" "argocd.argoproj.io/hook-delete-policy" "argocd.argoproj.io/sync-wave") }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    # Before the provisioning Job (weight/wave 0), which logs in with the administrator account.
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/sync-wave: "-10"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation,HookSucceeded
+spec:
+  activeDeadlineSeconds: {{ .Values.provisioning.reconcile.activeDeadlineSeconds }}
+  backoffLimit: {{ .Values.provisioning.reconcile.backoffLimit }}
+  template:
+    metadata:
+      labels:
+        {{- include "common.labels.standard" (dict "customLabels" (dict "app.kubernetes.io/name" (printf "%s-admin-bootstrap" (include "stalwart.name" .))) "context" .) | nindent 8 }}
+        app.kubernetes.io/component: admin-bootstrap
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ $name }}
+      automountServiceAccountToken: false
+      {{- include "common.images.renderPullSecrets" (dict "images" (list .Values.provisioning.reconcile.image) "context" $) | nindent 6 }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: bootstrap
+          image: {{ include "common.images.image" (dict "imageRoot" .Values.provisioning.reconcile.image "global" .Values.global) | quote }}
+          imagePullPolicy: {{ .Values.provisioning.reconcile.image.pullPolicy }}
+          command: ["python3", "-I", "/config/reconcile.py", "bootstrap"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          env:
+            - name: CONFIG_FILE
+              value: /config/config.json
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+            - name: JOB_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: "metadata.labels['batch.kubernetes.io/controller-uid']"
+          resources:
+            {{- toYaml .Values.provisioning.reconcile.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+            - name: kube-api-access
+              mountPath: /var/run/secrets/stalwart
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $name }}
+        - name: kube-api-access
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 600
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+        - name: tmp
+          emptyDir: {}
+{{- end }}
 {{- end }}

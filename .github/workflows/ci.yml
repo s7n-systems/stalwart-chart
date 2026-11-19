@@ -50,6 +50,7 @@ jobs:
         run: |
           python3 tests/render.py
           python3 tests/test_reconcile.py
+          python3 tests/test_gateway.py
           python3 tests/test_e2e_harness.py
 
   docs:

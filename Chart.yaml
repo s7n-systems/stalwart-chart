@@ -3,7 +3,7 @@ apiVersion: "v2"
 name: "stalwart"
 description: "Helm chart for the Stalwart mail and collaboration server, with optional Bulwark webmail"
 type: "application"
-version: "0.6.2"
+version: "0.7.0"
 # Kept in step with image.tag in values.yaml.
 # renovate: image=docker.io/stalwartlabs/stalwart
 appVersion: "v1.1.1"
@@ -57,11 +57,8 @@ annotations:
     - name: "bulwark"
       image: "ghcr.io/bulwarkmail/webmail:1.21.2@sha256:037b85b1433233d2d7eebb83f928df5ecc3b4adc91dc7e4c55f0a2f69024e754"
   artifacthub.io/changes: |
-    - kind: "changed"
-      description: "Stalwart 1.1.1: masked email addresses are part of the open source edition; Bulwark 1.21.2 shows them under Settings > Security"
-      links:
-        - name: "Stalwart 1.1.1"
-          url: "https://github.com/stalwartlabs/stalwart/releases/tag/v1.1.1"
+    - kind: "added"
+      description: "adminAccount: the Jobs log in with an app password that Stalwart accepts only from inside its pod, through a gateway container, instead of a static administrator password"
     - kind: "security"
-      description: "Stalwart 1.1.1 limits IMAP request memory, serves WebDAV file downloads with a sandboxing CSP, and keeps queued messages within their tenant"
+      description: "No static administrator needed: the recovery administrator works over HTTPS, IMAP and SMTP from any address"
 ...

@@ -7,6 +7,15 @@
       name: {{ .Values.recoveryAdmin.existingSecret | quote }}
       key: {{ .Values.recoveryAdmin.secretKey | quote }}
 {{- end }}
+{{- if .Values.adminAccount.enabled }}
+{{/* Only set while the bootstrap Job creates the administrator account. */}}
+- name: STALWART_RECOVERY_ADMIN
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "stalwart.adminSecretName" . | quote }}
+      key: STALWART_RECOVERY_ADMIN
+      optional: true
+{{- end }}
 {{- with .Values.encryption.blobKey.existingSecret }}
 - name: STALWART_BLOB_KEY
   valueFrom:

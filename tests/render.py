@@ -1272,6 +1272,125 @@ class ChartChecks(unittest.TestCase):
                         {'extraEnvVars': [{'name': 'DUP', 'value': '1'}, {'name': 'DUP', 'value': '2'}]}):
             render({'webmail': {'enabled': True, **invalid}}, succeeds=False)
 
+    def test_admin_account(self):
+        client = {'id': 'connector', 'secret': {'name': 'connector-stalwart', 'namespace': 'apps'}}
+        docs = render({'adminAccount': {'enabled': True, 'clients': [client]}, 'oidc': {'enabled': True, 'issuerUrl': 'https://id.example.org/realms/x'},
+                       'domain': 'example.org', 'certificateReload': {'enabled': True}})
+        by = {(d['kind'], d['metadata'].get('namespace'), d['metadata']['name']): d for d in docs}
+
+        # No static administrator: no provisioning credentials needed, no chart-managed env Secret.
+        self.assertNotIn(('Secret', 'mail', 'stalwart-env'), by)
+        pod = workload(docs)['spec']['template']['spec']
+        stalwart, gateway = pod['containers']
+        recovery = next(e for e in stalwart['env'] if e['name'] == 'STALWART_RECOVERY_ADMIN')
+        self.assertEqual(recovery['valueFrom'], {'secretKeyRef': {'name': 'stalwart-admin-account', 'key': 'STALWART_RECOVERY_ADMIN', 'optional': True}})
+
+        # The gateway forwards its own port to the management listener on 127.0.0.1.
+        self.assertEqual(gateway['name'], 'admin-gateway')
+        self.assertEqual(gateway['command'], ['python3', '-I', '/gateway/gateway.py'])
+        self.assertEqual({e['name']: e['value'] for e in gateway['env']}, {'GATEWAY_PORT': '8081', 'TARGET_PORT': '8080', 'PYTHONDONTWRITEBYTECODE': '1'})
+        self.assertEqual(gateway['ports'], [{'name': 'admin', 'containerPort': 8081}])
+        self.assertTrue(gateway['securityContext']['readOnlyRootFilesystem'])
+        self.assertTrue(gateway['securityContext']['runAsNonRoot'])
+        self.assertEqual(by[('ConfigMap', 'mail', 'stalwart-admin-gateway')]['data']['gateway.py'], (ROOT / 'files/gateway.py').read_text())
+        self.assertIn('checksum/admin-gateway', workload(docs)['spec']['template']['metadata']['annotations'])
+        service = by[('Service', 'mail', 'stalwart-admin')]['spec']
+        self.assertEqual((service['type'], service['ports']), ('ClusterIP', [{'name': 'admin', 'port': 8081, 'targetPort': 'admin'}]))
+        # Only its own Service routes to the gateway port.
+        for doc in docs:
+            if doc['kind'] in ('Service', 'Ingress', 'HTTPRoute') and doc['metadata']['name'] != 'stalwart-admin':
+                self.assertNotIn("'admin'", str(doc.get('spec')).replace("'admin-", ''), doc['metadata']['name'])
+
+        # The Secret is declared without data; the bootstrap Job is its only writer.
+        secret = by[('Secret', 'mail', 'stalwart-admin-account')]
+        self.assertNotIn('data', secret)
+        self.assertNotIn('stringData', secret)
+        self.assertNotIn('data', by[('Secret', 'apps', 'connector-stalwart')])
+        self.assertEqual(by[('Role', 'mail', 'stalwart-reconcile')]['rules'][1]['resourceNames'], ['stalwart-admin-account'])
+        self.assertEqual(by[('Role', 'apps', 'stalwart-reconcile')]['rules'], [
+            {'apiGroups': [''], 'resources': ['secrets'], 'resourceNames': ['connector-stalwart'], 'verbs': ['get', 'update']}])
+
+        # The bootstrap runs first, then every Job logs in with the account through the gateway.
+        bootstrap = by[('Job', 'mail', 'stalwart-admin-bootstrap')]
+        self.assertEqual(bootstrap['metadata']['annotations']['helm.sh/hook-weight'], '-10')
+        self.assertEqual(bootstrap['metadata']['annotations']['argocd.argoproj.io/sync-wave'], '-10')
+        container = bootstrap['spec']['template']['spec']['containers'][0]
+        self.assertEqual(container['command'], ['python3', '-I', '/config/reconcile.py', 'bootstrap'])
+        self.assertFalse([e for e in container['env'] if e['name'].startswith('STALWART_')])
+        self.assertEqual(bootstrap['spec']['template']['spec']['serviceAccountName'], 'stalwart-reconcile')
+        expected = [{'name': 'STALWART_USER', 'value': 'chart-admin@stalwart.internal'},
+                    {'name': 'STALWART_PASSWORD', 'valueFrom': {'secretKeyRef': {'name': 'stalwart-admin-account', 'key': 'password'}}}]
+        for job in (by[('Job', 'mail', 'stalwart-provisioning')], by[('Job', 'mail', 'stalwart-reconcile')],
+                    by[('CronJob', 'mail', 'stalwart-certificate-reload')]['spec']['jobTemplate']):
+            env = job['spec']['template']['spec']['containers'][0]['env']
+            self.assertEqual([e for e in env if e['name'] in ('STALWART_USER', 'STALWART_PASSWORD')], expected)
+            url = next((e['value'] for e in env if e['name'] == 'STALWART_URL'), None)
+            self.assertIn(url, (None, 'http://stalwart-admin:8081'))
+
+        config = json.loads(by[('ConfigMap', 'mail', 'stalwart-reconcile')]['data']['config.json'])
+        self.assertEqual(config['stalwartUrl'], 'http://stalwart-admin:8081')
+        self.assertEqual(config['adminAccount'], {
+            'name': 'chart-admin', 'domain': 'stalwart.internal', 'address': 'chart-admin@stalwart.internal',
+            'allowedIps': ['127.0.0.1', '::1'], 'secret': {'name': 'stalwart-admin-account', 'namespace': 'mail'},
+            'clients': [{'id': 'admin-connector', 'name': 'chart-admin', 'address': 'chart-admin@stalwart.internal',
+                         'appPassword': {'allowedIps': ['127.0.0.1', '::1'], 'permissions': {'@type': 'Inherit'}},
+                         'secret': {'create': True, 'name': 'connector-stalwart', 'namespace': 'apps', 'keys': ['password']}}]})
+
+        # The account alone still needs the reconcile RBAC for its bootstrap.
+        docs = render({'adminAccount': {'enabled': True}})
+        self.assertTrue(any(d['kind'] == 'Job' and d['metadata']['name'] == 'stalwart-admin-bootstrap' for d in docs))
+        # Without it, nothing changes.
+        docs = render({'provisioning': {'existingSecret': 'admin'}, 'hostname': 'mail.example.org', 'domain': 'example.org'})
+        self.assertFalse([d for d in docs if 'admin-' in d['metadata']['name'] or d['metadata']['name'] == 'stalwart-admin'])
+        self.assertEqual(len(workload(docs)['spec']['template']['spec']['containers']), 1)
+
+    def test_admin_account_validation(self):
+        enabled = {'enabled': True}
+        cases = [
+            ({'adminAccount': enabled, 'recoveryAdmin': {'enabled': True, 'password': 'x'}}, 'exclusive'),
+            ({'adminAccount': {**enabled, 'domain': 'example.org'}, 'domain': 'example.org'}, 'must not be a mail domain'),
+            ({'adminAccount': {**enabled, 'domain': 'example.org'}, 'mailDomain': 'example.org'}, 'must not be a mail domain'),
+            ({'adminAccount': {**enabled, 'gateway': {'port': 8080}}}, 'must differ from the management port'),
+            ({'adminAccount': {'clients': [{'id': 'a', 'secret': {'name': 's'}}]}}, 'requires adminAccount.enabled'),
+            ({'adminAccount': {**enabled, 'clients': [{'id': 'a', 'secret': {'name': 's'}}, {'id': 'a', 'secret': {'name': 't'}}]}}, 'used twice'),
+            ({'adminAccount': {**enabled, 'clients': [{'id': 'a', 'secret': {'name': 'stalwart-admin-account'}}]}}, 'used by another account'),
+            ({'adminAccount': {**enabled, 'clients': [{'id': 'a', 'secret': {'name': 's'}}]},
+              'systemAccounts': {'accounts': [{'id': 'm', 'name': 'm', 'secret': {'name': 's'}}]}, 'domain': 'example.org'}, 'used by another account'),
+            ({'adminAccount': {**enabled, 'name': 'mailer'}, 'domain': 'example.org',
+              'systemAccounts': {'accounts': [{'id': 'm', 'name': 'mailer', 'secret': {'name': 's'}}]}}, 'also a system account'),
+            ({'adminAccount': {**enabled, 'autoscaling': True}}, 'adminAccount'),
+        ]
+        for values, message in cases:
+            with self.subTest(message=message, values=values):
+                self.assertIn(message, render(values, succeeds=False))
+        # Autoscaling counts the gateway's requests.
+        multi = {'dataStore': {'backend': 'postgresql', 'postgresql': {'host': 'pg', 'existingSecret': 'pg'}},
+                 'coordinator': {'externallyManaged': True}, 'autoscaling': {'enabled': True, 'maxReplicas': 3, 'targetCPUUtilizationPercentage': 70}}
+        error = render({**multi, 'adminAccount': {'enabled': True, 'gateway': {'resources': {'requests': None}}}}, succeeds=False)
+        self.assertIn('sidecars admin-gateway', error)
+        render({**multi, 'adminAccount': {'enabled': True}})
+
+    def test_admin_account_network_policy(self):
+        connector = {'namespaceSelector': {'matchLabels': {'kubernetes.io/metadata.name': 'apps'}}}
+        ingress_nginx = {'namespaceSelector': {'matchLabels': {'kubernetes.io/metadata.name': 'ingress-nginx'}}}
+        docs = render({'networkPolicy': {'enabled': True, 'management': {'from': [ingress_nginx]}}, 'ingress': {'enabled': True, 'backend': 'management', 'hosts': [{'host': 'mail.example.org', 'paths': [{'path': '/', 'pathType': 'Prefix'}]}]},
+                       'adminAccount': {'enabled': True, 'gateway': {'from': [connector]}}, 'webmail': {'enabled': True}})
+        server = next(d for d in docs if d['kind'] == 'NetworkPolicy' and d['metadata']['name'] == 'stalwart')['spec']
+        rule = next(i for i in server['ingress'] if i['ports'] == [{'port': 'admin', 'protocol': 'TCP'}])
+        jobs, extra = rule['from']
+        self.assertEqual(extra, connector)
+        self.assertEqual(jobs['podSelector']['matchLabels'], {'app.kubernetes.io/instance': 'stalwart'})
+        allowed = jobs['podSelector']['matchExpressions'][0]['values']
+        # Every pod that logs in with the account is admitted; the webmail and the ingress are not.
+        for doc in docs:
+            if doc['kind'] in ('Job', 'Deployment', 'StatefulSet', 'CronJob'):
+                template = doc['spec']['jobTemplate']['spec']['template'] if doc['kind'] == 'CronJob' else doc['spec']['template']
+                component = template['metadata']['labels'].get('app.kubernetes.io/component')
+                env = [e['name'] for c in template['spec']['containers'] for e in c.get('env', [])]
+                uses = 'STALWART_PASSWORD' in env or doc['metadata']['name'].endswith('admin-bootstrap')
+                self.assertEqual(component in allowed, uses, doc['metadata']['name'])
+        self.assertNotIn(ingress_nginx, rule['from'])
+
     def test_network_policies(self):
         self.assertFalse([d for d in render({'webmail': {'enabled': True}}) if d['kind'] == 'NetworkPolicy'])
         ingress_nginx = {'namespaceSelector': {'matchLabels': {'kubernetes.io/metadata.name': 'ingress-nginx'}}}

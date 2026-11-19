@@ -231,5 +231,173 @@ class ReconcileChecks(unittest.TestCase):
             self.assertEqual(r.Kubernetes().base, 'https://[fd00::1]:443')
 
 
+def b64(value):
+    return base64.b64encode(value.encode()).decode()
+
+
+class AdminBootstrapChecks(unittest.TestCase):
+    """The administrator account's bootstrap: a temporary recovery administrator only while the
+    recorded app password does not work."""
+
+    def setUp(self):
+        self.config = {'release': 'mail', 'lockTimeoutSeconds': 300, 'stalwartUrl': 'http://mail-admin:8081', 'smtpCheck': {'host': 'x'},
+                       'restart': {'namespace': 'mail', 'statefulset': 'mail', 'settingsHash': 'hash', 'timeoutSeconds': 30},
+                       'adminAccount': {'name': 'chart-admin', 'domain': 'stalwart.internal', 'address': 'chart-admin@stalwart.internal',
+                                        'allowedIps': ['127.0.0.1', '::1'], 'secret': {'namespace': 'mail', 'name': 'mail-admin-account'},
+                                        'clients': []}}
+        self.secret = {'metadata': {'namespace': 'mail', 'name': 'mail-admin-account', 'annotations': {}}, 'data': {}}
+        self.kube = Mock()
+        self.kube.get_secret.side_effect = lambda *a: copy.deepcopy(self.secret)
+        def replace(secret):
+            self.secret = copy.deepcopy(secret)
+            return copy.deepcopy(secret)
+        self.kube.replace_secret.side_effect = replace
+        self.rolls = []
+        # The StatefulSet's bootstrap stamp and whether its rollout finished.
+        self.stamp, self.rolled = '', True
+        def statefulset(*_):
+            return {'metadata': {'generation': 1}, 'spec': {'replicas': 1, 'template': {'metadata': {'annotations': {r.BOOTSTRAP: self.stamp}}}},
+                    'status': ({'observedGeneration': 1, 'updatedReplicas': 1, 'readyReplicas': 1, 'currentRevision': 'a', 'updateRevision': 'a'}
+                               if self.rolled else {'observedGeneration': 1, 'updatedReplicas': 0, 'readyReplicas': 1, 'currentRevision': 'a', 'updateRevision': 'b'})}
+        self.kube.get_statefulset.side_effect = statefulset
+        # Stalwart accepts the recovery administrator only while the pods run with it, and the
+        # account's app password once the Secret records the created one.
+        self.running_recovery = None
+        self.created = None
+        def roll(config, kube, stamp):
+            self.stamp = stamp
+            self.rolls.append(stamp.split('@')[0])
+            data = self.secret.get('data') or {}
+            self.running_recovery = base64.b64decode(data[r.RECOVERY_KEY]).decode() if data.get(r.RECOVERY_KEY) else None
+        def accepted(url, user, password, **_):
+            if user == 'chart-admin@stalwart.internal':
+                return password == self.created
+            return self.running_recovery == f'{user}:{password}'
+        def reconcile_account(config, account, kube, stalwart):
+            self.reconciled = (config, account)
+            self.created = 'app-password'
+            secret = kube.get_secret('mail', 'mail-admin-account')
+            secret['data'] = {**secret['data'], 'password': b64('app-password')}
+            kube.replace_secret(secret)
+        self.waited = []
+        self.patches = [patch.object(r, 'roll', side_effect=roll), patch.object(r, 'login_accepted', side_effect=accepted),
+                        patch.object(r, 'wait_rollout', side_effect=lambda *a: self.waited.append(True)),
+                        patch.object(r, 'reconcile_account', side_effect=reconcile_account), patch.object(r, 'Stalwart')]
+        for p in self.patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in self.patches])
+
+    def test_working_password_needs_nothing(self):
+        self.secret['data'] = {'password': b64('app-password')}
+        self.created = 'app-password'
+        r.bootstrap(self.config, self.kube)
+        self.assertEqual(self.rolls, [])
+        r.Stalwart.assert_not_called()
+        self.kube.replace_secret.assert_not_called()
+
+    def test_first_run_creates_account_and_removes_recovery_admin(self):
+        r.bootstrap(self.config, self.kube)
+        self.assertEqual(self.rolls, ['recovery', 'done'])
+        self.assertEqual(self.secret['data'], {'password': b64('app-password')})
+        user, password = r.Stalwart.call_args.args[1:]
+        self.assertTrue(user.startswith('bootstrap-'))
+        self.assertGreaterEqual(len(password), 32)
+        r.Stalwart.return_value.ensure_admin_account.assert_called_once_with('mail', 'chart-admin', 'stalwart.internal')
+        config, account = self.reconciled
+        self.assertIsNone(config['smtpCheck'])
+        self.assertEqual(account['appPassword'], {'allowedIps': ['127.0.0.1', '::1'], 'permissions': {'@type': 'Inherit'}})
+        self.assertEqual(account['secret'], {'namespace': 'mail', 'name': 'mail-admin-account', 'keys': ['password']})
+        self.assertIsNone(self.running_recovery)
+
+    def test_retry_reuses_the_running_recovery_admin(self):
+        self.secret['data'] = {r.RECOVERY_KEY: b64('bootstrap-1:secret')}
+        self.running_recovery = 'bootstrap-1:secret'
+        r.bootstrap(self.config, self.kube)
+        self.assertEqual(self.rolls, ['done'])
+        self.assertEqual(r.Stalwart.call_args.args[1:], ('bootstrap-1', 'secret'))
+
+    def test_leftover_recovery_admin_is_removed(self):
+        self.secret['data'] = {'password': b64('app-password'), r.RECOVERY_KEY: b64('bootstrap-1:secret')}
+        self.created = 'app-password'
+        self.running_recovery = 'bootstrap-1:secret'
+        r.bootstrap(self.config, self.kube)
+        self.assertEqual(self.rolls, ['done'])
+        self.assertNotIn(r.RECOVERY_KEY, self.secret['data'])
+        r.Stalwart.assert_not_called()
+
+    def test_interrupted_cleanup_restarts_without_recovery_admin(self):
+        # The key is gone from the Secret, but the run died before the restart: the pods still run
+        # with the recovery administrator (stamp "recovery@...").
+        self.secret['data'] = {'password': b64('app-password')}
+        self.created = 'app-password'
+        self.stamp, self.running_recovery = 'recovery@1', 'bootstrap-1:secret'
+        r.bootstrap(self.config, self.kube)
+        self.assertEqual(self.rolls, ['done'])
+        self.assertIsNone(self.running_recovery)
+        r.Stalwart.assert_not_called()
+
+    def test_unfinished_rollout_without_recovery_admin_is_awaited(self):
+        self.secret['data'] = {'password': b64('app-password')}
+        self.created = 'app-password'
+        self.stamp, self.rolled = 'done@2', False
+        r.bootstrap(self.config, self.kube)
+        self.assertEqual((self.rolls, self.waited), ([], [True]))
+
+    def test_finished_bootstrap_needs_nothing(self):
+        self.secret['data'] = {'password': b64('app-password')}
+        self.created = 'app-password'
+        self.stamp = 'done@2'
+        r.bootstrap(self.config, self.kube)
+        self.assertEqual((self.rolls, self.waited), ([], []))
+
+    def test_refused_password_is_replaced(self):
+        self.secret['data'] = {'password': b64('revoked')}
+        seen = []
+        original = r.reconcile_account.side_effect
+        def reconcile_account(config, account, kube, stalwart):
+            seen.append(dict(kube.get_secret('mail', 'mail-admin-account')['data']))
+            original(config, account, kube, stalwart)
+        r.reconcile_account.side_effect = reconcile_account
+        r.bootstrap(self.config, self.kube)
+        # reconcile_account sees no password, so it revokes the recorded credential and creates one.
+        self.assertNotIn('password', seen[0])
+        self.assertEqual(self.secret['data'], {'password': b64('app-password')})
+
+    def test_refused_new_password_keeps_recovery_admin_for_the_retry(self):
+        r.login_accepted.side_effect = lambda url, user, password, **_: user != 'chart-admin@stalwart.internal' and self.running_recovery == f'{user}:{password}'
+        with self.assertRaises(r.Failure):
+            r.bootstrap(self.config, self.kube)
+        self.assertIn(r.RECOVERY_KEY, self.secret['data'])
+        self.assertEqual(self.rolls, ['recovery'])
+
+    def test_recovery_admin_refused_after_restart_fails(self):
+        r.roll.side_effect = lambda config, kube, stamp: self.rolls.append(stamp)
+        with self.assertRaises(r.Failure):
+            r.bootstrap(self.config, self.kube)
+        r.Stalwart.assert_not_called()
+
+    def test_recovery_admin_still_accepted_fails(self):
+        r.roll.side_effect = lambda config, kube, stamp: (self.rolls.append(stamp), setattr(self, 'running_recovery', self.running_recovery or base64.b64decode(self.secret['data'][r.RECOVERY_KEY]).decode()))
+        with self.assertRaises(r.Failure):
+            r.bootstrap(self.config, self.kube)
+
+    def test_regular_run_publishes_client_passwords_without_smtp_check(self):
+        client = {'id': 'admin-connector', 'name': 'chart-admin', 'address': 'chart-admin@stalwart.internal',
+                  'appPassword': {'allowedIps': ['127.0.0.1', '::1'], 'permissions': {'@type': 'Inherit'}},
+                  'secret': {'create': True, 'name': 'connector', 'namespace': 'mail', 'keys': ['password']}}
+        self.config['adminAccount']['clients'] = [client]
+        self.config['accounts'] = []
+        calls = []
+        r.reconcile_account.side_effect = lambda config, account, kube, stalwart: calls.append((config['smtpCheck'], account['id']))
+        with patch.object(r, 'Kubernetes', return_value=self.kube), patch.object(r, 'blob_key', return_value=False), \
+                patch.object(r, 'restart'), patch.object(r.sys, 'argv', ['reconcile.py']), \
+                patch.dict(os.environ, {'STALWART_USER': 'chart-admin@stalwart.internal', 'STALWART_PASSWORD': 'x', 'CONFIG_FILE': '/dev/null'}), \
+                patch.object(r.json, 'load', return_value=self.config), patch('builtins.open'):
+            with self.assertRaises(SystemExit) as exit:
+                r.main()
+        self.assertEqual(exit.exception.code, 0)
+        self.assertEqual(calls, [(None, 'admin-connector')])
+
+
 if __name__ == '__main__':
     unittest.main()

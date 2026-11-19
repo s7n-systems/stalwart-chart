@@ -17,6 +17,7 @@ declare -A matrix=(
   [example]="-f $chart/examples/postgresql-s3.yaml"
   [full]="-f $chart/ci/full.yaml"
   [rocksdb]="-f $chart/ci/rocksdb.yaml"
+  [admin-account]="-f $chart/ci/admin-account.yaml"
 )
 for name in "${!matrix[@]}"; do
   # shellcheck disable=SC2086  # word splitting of the -f argument is intended

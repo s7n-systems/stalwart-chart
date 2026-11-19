@@ -35,6 +35,9 @@ spec:
         {{- end }}
         checksum/config: {{ include (print $.Template.BasePath "/stalwart/configmap.yaml") . | sha256sum }}
         checksum/secret: {{ include (print $.Template.BasePath "/stalwart/secret.yaml") . | sha256sum }}
+        {{- if .Values.adminAccount.enabled }}
+        checksum/admin-gateway: {{ .Files.Get "files/gateway.py" | sha256sum }}
+        {{- end }}
     spec:
       serviceAccountName: {{ include "stalwart.serviceAccountName" . }}
       automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
@@ -145,6 +148,41 @@ spec:
             {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+        {{- if .Values.adminAccount.enabled }}
+        # The administrator account's gateway: its app passwords are accepted from 127.0.0.1 only.
+        - name: admin-gateway
+          image: {{ include "common.images.image" (dict "imageRoot" .Values.provisioning.reconcile.image "global" .Values.global) | quote }}
+          imagePullPolicy: {{ .Values.provisioning.reconcile.image.pullPolicy }}
+          command: ["python3", "-I", "/gateway/gateway.py"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            capabilities:
+              drop: [ALL]
+          env:
+            - name: GATEWAY_PORT
+              value: {{ .Values.adminAccount.gateway.port | quote }}
+            - name: TARGET_PORT
+              value: {{ include "stalwart.managementPort" . | quote }}
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+          ports:
+            - name: admin
+              containerPort: {{ .Values.adminAccount.gateway.port }}
+          readinessProbe:
+            tcpSocket:
+              port: admin
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.adminAccount.gateway.resources | nindent 12 }}
+          volumeMounts:
+            - name: admin-gateway
+              mountPath: /gateway
+              readOnly: true
+        {{- end }}
         {{- with .Values.sidecars }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -165,6 +203,11 @@ spec:
         - name: config
           configMap:
             name: {{ include "stalwart.fullname" . }}-config
+        {{- if .Values.adminAccount.enabled }}
+        - name: admin-gateway
+          configMap:
+            name: {{ include "stalwart.fullname" . }}-admin-gateway
+        {{- end }}
         {{- if .Values.tls.enabled }}
         # Mounted as a directory, not by subPath, so renewed files appear without a restart.
         - name: tls
