@@ -105,7 +105,8 @@ pushShard: ""
 # Recovery / bootstrap administrator credential.
 # Supply this on first install to allow initial administrator sign-in.
 # Remove it once a permanent administrator account has been
-# provisioned through the setup wizard.
+# provisioned through the setup wizard. It has all permissions and no IP
+# restriction, also on the mail ports; prefer adminAccount.
 recoveryAdmin:
   enabled: false
   username: "admin"
@@ -113,6 +114,47 @@ recoveryAdmin:
   # -- Preferred: key containing the complete username:password credential.
   existingSecret: ""
   secretKey: "STALWART_RECOVERY_ADMIN"
+
+# Administrator account for the chart's Jobs, instead of a static administrator password
+# (recoveryAdmin and provisioning credentials). A Stalwart account with the Admin role, whose
+# app passwords Stalwart accepts from 127.0.0.1 and ::1 only: only through a gateway container
+# in the Stalwart pods (Service `<fullname>-admin`), never through the ingress, the HTTPRoute
+# or the mail ports. A bootstrap Job creates the account: on the first run, and whenever the
+# recorded password no longer works (database reset, revoked), it starts Stalwart with a random
+# recovery administrator, creates the account and its app password, then removes the recovery
+# administrator again (two restarts). Exclusive with recoveryAdmin. See "Administrator account"
+# in the README.
+adminAccount:
+  # -- Use the administrator account. Exclusive with recoveryAdmin.
+  enabled: false
+  # -- Account name; the login is `<name>@<domain>`.
+  name: "chart-admin"
+  # -- A domain of its own, not a mail domain: no user of the directory (OIDC) maps to the
+  # account. Stalwart refuses `.invalid`; `.internal` is reserved for private use.
+  domain: "stalwart.internal"
+  gateway:
+    # -- Port of the gateway container and of the `<fullname>-admin` Service.
+    port: 8081
+    # -- NetworkPolicyPeers allowed to reach the gateway (networkPolicy.enabled), in addition
+    # to the chart's Jobs. E.g. the clients below.
+    from: []
+    resources:
+      requests:
+        cpu: "10m"
+        memory: "32Mi"
+      limits:
+        memory: "64Mi"
+  # -- Further app passwords of the account for in-cluster clients, e.g. a provisioning
+  # connector. They log in as `<name>@<domain>` through the `<fullname>-admin` Service. The
+  # reconcile Job writes each password into a Secret, like those of systemAccounts; a client
+  # picks up a new one when it restarts. Example:
+  #   - id: connector
+  #     secret:
+  #       create: true          # false: an existing Secret, delegated to the Job
+  #       name: connector-stalwart
+  #       namespace: ""         # default: the release namespace
+  #       keys: [password]
+  clients: []
 
 # Starts the pods in recovery mode. Suspends mail services and
 # exposes only the management listener on the configured port.

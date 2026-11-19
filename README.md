@@ -49,7 +49,7 @@ The chart deploys Stalwart 1.0 as a StatefulSet and configures it the way Stalwa
 - [Configuration](#configuration)
   - [Images](#images) · [Credentials](#credentials) · [Storage](#storage) · [Server settings](#server-settings)
   - [Networking](#networking) · [TLS certificates](#tls-certificates) · [Monitoring](#monitoring) · [Authentication](#authentication)
-  - [Enterprise edition](#enterprise-edition) · [System accounts](#system-accounts) · [Webmail](#webmail) · [Scaling](#scaling) · [Security](#security)
+  - [Enterprise edition](#enterprise-edition) · [Administrator account](#administrator-account) · [System accounts](#system-accounts) · [Webmail](#webmail) · [Scaling](#scaling) · [Security](#security)
 - [Operations](#operations)
 - [Development](#development)
 - [Values](#values)
@@ -61,6 +61,7 @@ The chart deploys Stalwart 1.0 as a StatefulSet and configures it the way Stalwa
 | --- | --- |
 | **Storage** | External PostgreSQL (default) or local RocksDB as the database; S3 or any S3-compatible service for mail blobs |
 | **Declarative settings** | Blob store, server hostname and default domain, Prometheus exporter, logging, OIDC directory, in-memory store, cluster coordinator, encryption at rest, blob encryption and compression, Enterprise license and logo applied by a CLI Job; anything else through `provisioning.extraPlan` |
+| **Administrator account** | No static administrator: the Jobs use an app password that works only from inside the Stalwart pod |
 | **System accounts** | Send-only accounts for other applications, with app passwords published to Secrets |
 | **Exposure** | Mail Service for SMTP, IMAP, POP3 and ManageSieve (LoadBalancer or NodePort); Ingress or Gateway API HTTPRoute for the web UI, JMAP and DAV; Gateway API TCPRoutes for mail ports; dual-stack |
 | **Scaling** | HorizontalPodAutoscaler with a conservative scale-down, PodDisruptionBudget, anti-affinity presets, topology spread, priority classes, sidecars, NATS/Redis/Kafka/Zenoh coordination |
@@ -102,7 +103,7 @@ Copy the example to `my-values.yaml`, set the database host, bucket, `hostname` 
 
 ```sh
 helm upgrade --install stalwart oci://ghcr.io/s7n-systems/charts/stalwart \
-  --version 0.6.2 --namespace stalwart -f my-values.yaml --timeout 15m
+  --version 0.7.0 --namespace stalwart -f my-values.yaml --timeout 15m
 ```
 
 The chart validates required storage settings and credential references before rendering. It cannot check whether referenced Secrets exist or whether external services are reachable; these failures can still leave an incomplete installation. To install from a checkout instead, use `.` as the chart: Bitnami Common is vendored in `charts/`, so no dependency download is needed.
@@ -112,7 +113,7 @@ The chart validates required storage settings and credential references before r
 Release builds are signed keylessly with cosign 3 from this repository's release workflow. Cosign 3 stores the signature as an OCI referrer in the new bundle format; verify with cosign 3 or newer (cosign 2 reports "no signatures found"):
 
 ```sh
-cosign verify ghcr.io/s7n-systems/charts/stalwart:0.6.2 \
+cosign verify ghcr.io/s7n-systems/charts/stalwart:0.7.0 \
   --certificate-identity-regexp '^https://github\.com/s7n-systems/stalwart-chart/\.github/workflows/release\.yml@' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
@@ -122,14 +123,14 @@ cosign verify ghcr.io/s7n-systems/charts/stalwart:0.6.2 \
 For an interactive first-time setup, use recovery mode, which suspends mail services and opens only the management listener. You can instead provision domains and other settings through `provisioning.extraPlan` during a normal installation.
 
 ```sh
-helm upgrade --install stalwart oci://ghcr.io/s7n-systems/charts/stalwart --version 0.6.2 \
+helm upgrade --install stalwart oci://ghcr.io/s7n-systems/charts/stalwart --version 0.7.0 \
   --namespace stalwart -f my-values.yaml --set recoveryMode.enabled=true --timeout 15m
 kubectl --namespace stalwart port-forward svc/stalwart-management 8080:8080
 ```
 
 Open <http://localhost:8080/admin>, sign in with the recovery administrator, and create domains, accounts and anything else you need. Then run the same `helm upgrade` with `recoveryMode.enabled=false`.
 
-Afterwards, point the provisioning credential at a permanent administrator. If `recoveryAdmin.enabled` is set, disable it before removing its referenced Secret key. Remove `STALWART_RECOVERY_ADMIN` from any Secret loaded through `existingSecret`, then restart the pods. The provisioning Job needs a valid administrator on every upgrade.
+With `adminAccount.enabled` you need no administrator credentials at all, see [Administrator account](#administrator-account). Otherwise, point the provisioning credential at a permanent administrator afterwards. If `recoveryAdmin.enabled` is set, disable it before removing its referenced Secret key. Remove `STALWART_RECOVERY_ADMIN` from any Secret loaded through `existingSecret`, then restart the pods. The provisioning Job needs a valid administrator on every upgrade.
 
 ## Configuration
 
@@ -150,7 +151,7 @@ Prefer existing Secrets: plain values are stored in Helm's release history, even
 | Recovery administrator | `recoveryAdmin.existingSecret`, `.secretKey` (value `username:password`) |
 | PostgreSQL | `dataStore.postgresql.existingSecret`, `.passwordSecretKey` |
 | S3 | `blobStore.s3.existingSecret`, `.accessKeyIdSecretKey`, `.secretKeySecretKey` |
-| Provisioning administrator | `provisioning.existingSecret`, `.passwordSecretKey` (password only; `provisioning.username` is separate) |
+| Provisioning administrator | `provisioning.existingSecret`, `.passwordSecretKey` (password only; `provisioning.username` is separate); none with `adminAccount` |
 | Metrics | `metrics.auth.existingSecret`, `.passwordSecretKey` |
 | NATS | `coordinator.nats.existingSecret`, `.passwordSecretKey` |
 | Bulwark | `webmail.sessionSecret`, `webmail.adminPassword`, `webmail.oauth` |
@@ -388,6 +389,54 @@ kubectl -n <namespace> rollout restart statefulset/<fullname>
 ```
  `enterprise.logo` is the default logo of Stalwart's web interface and login pages: a data URI, a base64-encoded image or an http(s) URL, at most 1 MiB. Domains and tenants can override it in the WebUI. Clearing a value later leaves the stored setting in place; change it in the WebUI.
 
+### Administrator account
+
+The Jobs of the chart need an administrator in Stalwart. The simplest one is the recovery administrator (`recoveryAdmin`). But it is a static password with all permissions. Stalwart accepts it from everywhere: over HTTPS, IMAP and SMTP. `adminAccount` replaces it.
+
+```yaml
+adminAccount:
+  enabled: true
+  name: chart-admin              # login: chart-admin@stalwart.internal
+  domain: stalwart.internal      # not a mail domain
+  clients:                       # optional: more app passwords, e.g. for a provisioning connector
+    - id: connector
+      secret: {name: connector-stalwart, namespace: provisioning}
+  gateway:
+    from:                        # with networkPolicy.enabled: who may reach the gateway
+      - namespaceSelector:
+          matchLabels: {kubernetes.io/metadata.name: provisioning}
+```
+
+How it works:
+
+- The account has the Admin role. Its domain is not a mail domain, so no user of the directory (OIDC) maps to it. It has no password, only app passwords.
+- Stalwart accepts these app passwords from `127.0.0.1` and `::1` only.
+- A small gateway container runs in the Stalwart pod. It forwards the port `admin` (Service `<fullname>-admin`, port 8081) to Stalwart on `127.0.0.1`. So the app passwords work through the gateway only.
+- The ingress, the HTTPRoute and the mail ports never reach the gateway.
+- This holds for both settings of Stalwart's `Http.clientIpSource`:
+  - `peer` (default): the address is the TCP peer. Only the gateway connects from `127.0.0.1`.
+  - `xForwardedFor` or `forwarded`, e.g. to see the real client behind the ingress: Stalwart takes the entry `forwardedHops` from the end, which the proxy (ingress-nginx, HAProxy) adds itself. A loopback address there is refused with HTTP 400, also from a pod that reaches the management port directly. Without the header, the TCP peer counts, so the gateway is `127.0.0.1`.
+- The Jobs (provisioning, reconcile, certificate reload) log in as `<name>@<domain>` through the gateway. Their app password is in the Secret `<fullname>-admin-account`, key `password`.
+- Each entry in `clients` gets its own app password of the same account. The reconcile Job writes it into the client's Secret, like for [system accounts](#system-accounts). The client logs in as `<name>@<domain>` at `http://<fullname>-admin.<namespace>:8081`.
+
+The bootstrap Job runs before the provisioning Job. It does nothing while the recorded app password works. Otherwise, for example on the first install or after a database reset, it:
+
+1. writes a random recovery administrator into the Secret `<fullname>-admin-account` (key `STALWART_RECOVERY_ADMIN`) and restarts Stalwart,
+2. creates the domain, the account and the app password, and records the password in the Secret,
+3. removes the recovery administrator from the Secret and restarts Stalwart again.
+
+Afterwards, no administrator password exists that works from outside the pod.
+
+Things to know:
+
+- The account must hold every permission it gives to others. Stalwart refuses to grant more. So it has the Admin role, not a smaller one. This also applies to the app passwords of `clients`: a provisioning connector that creates mail users (and administrators) needs all their permissions too. The protection is where the passwords work, not what they may do. A stolen client password is a full administrator inside the cluster, which is why the gateway needs the NetworkPolicy.
+- Anyone who can reach the gateway counts as `127.0.0.1`, but still needs the password. Enable `networkPolicy`: the gateway then admits only the chart's Jobs and `adminAccount.gateway.from`.
+- Mail listeners that trust the PROXY protocol from a network accept a client address from that network, also `127.0.0.1`. A pod there with the app password could log in over IMAP or SMTP as the account. The account's mailbox is empty, and the admin API is not reachable this way.
+- Too many failed logins through the gateway can make Stalwart block `127.0.0.1`. This blocks the Jobs and the clients too. Another reason for the NetworkPolicy.
+- For emergencies, add `STALWART_RECOVERY_ADMIN` (`user:password`) to the Secret `<fullname>-admin-account` and restart the pods. The next bootstrap run removes it again.
+- `adminAccount` works with and without OIDC. It is only for the Jobs and clients, not for people. With OIDC, people sign in to the web UI through the identity provider and need the Admin role there. Without OIDC, create a personal administrator with a password once: through the emergency step above, in the web UI (`/admin`). It stays in Stalwart's database. Or keep the old style (`recoveryAdmin` and provisioning credentials): it still works unchanged when `adminAccount` is off.
+- `adminAccount` and `recoveryAdmin` are exclusive. To switch an existing installation, disable `recoveryAdmin` and enable `adminAccount` in the same upgrade. The bootstrap Job then creates the account.
+
 ### System accounts
 
 Other applications that send mail, such as notifications or password resets, need an account with a password. Once authentication runs through an external directory (`oidc.activate`), Stalwart refuses passwords an administrator sets; it only accepts app passwords it generates itself and shows once. `systemAccounts.accounts` covers this: the provisioning Job creates each account, and the reconcile Job creates an app password for it and writes it into a Secret that the applications read.
@@ -598,12 +647,13 @@ NATS is recommended for most clusters (plain pub/sub, no JetStream); `redis`, `k
 
 Stalwart runs as UID/GID 2000 with a read-only root filesystem, `RuntimeDefault` seccomp, and all capabilities dropped except `NET_BIND_SERVICE`. Use `extraVolumes` for additional writable paths.
 
-Stalwart and webmail pods have no Kubernetes permissions and mount no ServiceAccount token. The reconciliation Job uses a short-lived projected token. Its Roles allow `get`/`patch` on this release's StatefulSet and `get`/`update` on the named system-account Secrets. Each Secret namespace gets its own Role. StatefulSet patch permission permits changes to the whole specification, not just the restart annotation.
+Stalwart and webmail pods have no Kubernetes permissions and mount no ServiceAccount token. The reconciliation Job uses a short-lived projected token. Its Roles allow `get`/`patch` on this release's StatefulSet and `get`/`update` on the named system-account Secrets (with `adminAccount` also its Secret and those of its clients). The bootstrap Job of `adminAccount` uses the same ServiceAccount. Each Secret namespace gets its own Role. StatefulSet patch permission permits changes to the whole specification, not just the restart annotation.
 
 The management Service is `ClusterIP`, but any pod in the cluster can reach it. `networkPolicy.enabled` restricts ingress to the Stalwart and webmail pods:
 
 - **Mail ports** (`service.ports`) stay open to any source; `networkPolicy.mail.from` narrows them, for example to a relay network.
 - **Management port**: only this release's pods (webmail, provisioning, reconcile and certificate-reload Jobs) and the peers in `networkPolicy.management.from`. Add your Ingress controller or Gateway when they use the management backend (the chart refuses to render without one), Prometheus for metrics, and in-cluster clients such as a provisioning connector.
+- **Admin port** (`adminAccount`): only the Jobs that log in with the administrator account and the peers in `adminAccount.gateway.from`. Not the webmail.
 - **Webmail port**: any source, or `networkPolicy.webmail.from`, normally the Ingress controller or Gateway.
 - `networkPolicy.extraIngress` appends rules to the Stalwart policy.
 
@@ -651,6 +701,7 @@ scripts/render-matrix.sh            # helm lint and render ci/*.yaml and the exa
 scripts/validate-manifests.sh       # kubeconform (Kubernetes 1.27 and 1.37, CRD schemas) and the Kyverno policies
 python3 tests/render.py             # template, NOTES.txt and helm test script unit tests
 python3 tests/test_reconcile.py     # reconciliation unit tests (no services required)
+python3 tests/test_gateway.py       # the administrator account's gateway, as a local process
 python3 tests/test_e2e_harness.py   # parts of the kind suite, without a cluster
 tests/e2e/run.sh                    # reconcile Job against Stalwart and a k3s API server (Docker)
 tests/e2e/kind.sh                   # the chart in a kind cluster: hooks, restart, RBAC, helm test, a consumer that logs in
@@ -675,6 +726,15 @@ Bitnami Common is vendored in `charts/` and updated by Renovate together with `C
 |-----|------|---------|-------------|
 | additionalAnnotations | object | `{}` |  |
 | additionalLabels | object | `{}` | Metadata is merged without changing immutable selector labels. |
+| adminAccount.clients | list | `[]` | Further app passwords of the account for in-cluster clients, e.g. a provisioning connector. They log in as `<name>@<domain>` through the `<fullname>-admin` Service. The reconcile Job writes each password into a Secret, like those of systemAccounts; a client picks up a new one when it restarts. Example:   - id: connector     secret:       create: true          # false: an existing Secret, delegated to the Job       name: connector-stalwart       namespace: ""         # default: the release namespace       keys: [password] |
+| adminAccount.domain | string | `"stalwart.internal"` | A domain of its own, not a mail domain: no user of the directory (OIDC) maps to the account. Stalwart refuses `.invalid`; `.internal` is reserved for private use. |
+| adminAccount.enabled | bool | `false` | Use the administrator account. Exclusive with recoveryAdmin. |
+| adminAccount.gateway.from | list | `[]` | NetworkPolicyPeers allowed to reach the gateway (networkPolicy.enabled), in addition to the chart's Jobs. E.g. the clients below. |
+| adminAccount.gateway.port | int | `8081` | Port of the gateway container and of the `<fullname>-admin` Service. |
+| adminAccount.gateway.resources.limits.memory | string | `"64Mi"` |  |
+| adminAccount.gateway.resources.requests.cpu | string | `"10m"` |  |
+| adminAccount.gateway.resources.requests.memory | string | `"32Mi"` |  |
+| adminAccount.name | string | `"chart-admin"` | Account name; the login is `<name>@<domain>`. |
 | affinity | object | `{}` | Explicit affinity always wins over podAntiAffinityPreset below. |
 | autoscaling.behavior | object | `{"scaleDown":{"policies":[{"periodSeconds":300,"type":"Pods","value":1}],"stabilizationWindowSeconds":600}}` | autoscaling/v2 behavior. Scaling down drops the removed pod's IMAP and SMTP sessions, so by default it removes at most one pod per five minutes, after ten minutes of lower load. Set to null for the Kubernetes defaults. |
 | autoscaling.enabled | bool | `false` |  |

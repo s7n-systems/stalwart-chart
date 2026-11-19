@@ -74,19 +74,8 @@ spec:
                   drop: [ALL]
               env:
                 - name: STALWART_URL
-                  value: {{ printf "http://%s-management:%v" (include "stalwart.fullname" .) .Values.management.servicePort | quote }}
-                - name: STALWART_USER
-                  value: {{ .Values.provisioning.username | quote }}
-                - name: STALWART_PASSWORD
-                  valueFrom:
-                    secretKeyRef:
-                      {{- if .Values.provisioning.existingSecret }}
-                      name: {{ .Values.provisioning.existingSecret | quote }}
-                      key: {{ .Values.provisioning.passwordSecretKey | quote }}
-                      {{- else }}
-                      name: {{ include "stalwart.fullname" . }}-env
-                      key: provisioningPassword
-                      {{- end }}
+                  value: {{ include "stalwart.jobsUrl" . | quote }}
+                {{- include "stalwart.jobsCredentials" . | nindent 16 }}
                 - name: XDG_CACHE_HOME
                   value: /cache
               resources:

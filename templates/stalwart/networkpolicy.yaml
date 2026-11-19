@@ -45,6 +45,24 @@ spec:
         {{- with .Values.networkPolicy.management.from }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
+    {{- if .Values.adminAccount.enabled }}
+    # The administrator account's gateway: only the chart's Jobs that log in with it, and
+    # adminAccount.gateway.from (e.g. a client of adminAccount.clients). Not the webmail.
+    - ports:
+        - port: admin
+          protocol: TCP
+      from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name | quote }}
+            matchExpressions:
+              - key: app.kubernetes.io/component
+                operator: In
+                values: [admin-bootstrap, provisioning, reconcile, certificate-reload]
+        {{- with .Values.adminAccount.gateway.from }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    {{- end }}
     {{- with .Values.networkPolicy.extraIngress }}
     {{- toYaml . | nindent 4 }}
     {{- end }}

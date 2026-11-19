@@ -1,5 +1,16 @@
 # Upgrading
 
+## Chart 0.7.0: administrator account
+
+No steps are needed. New: `adminAccount`, an administrator for the chart's Jobs without a static password. See [Administrator account](../README.md#administrator-account).
+
+To switch a running release from `recoveryAdmin` (and `provisioning.existingSecret` or `.password`) to `adminAccount`:
+
+1. In the same upgrade, set `recoveryAdmin.enabled: false` and `adminAccount.enabled: true`. The provisioning credentials are no longer used.
+2. The bootstrap Job restarts Stalwart twice: once with a temporary recovery administrator, once without it.
+3. Afterwards, the old administrator password no longer works. Delete it from your Secrets, and remove `STALWART_RECOVERY_ADMIN` from any Secret loaded through `existingSecret`.
+4. Clients that used the old administrator, such as a provisioning connector, need an entry in `adminAccount.clients`. They then log in as `<name>@<domain>` at `http://<fullname>-admin:8081`, with the password from their Secret.
+
 ## Chart 0.6.2: Stalwart 1.1.1
 
 No steps are needed for the chart. Stalwart 1.1.1:

@@ -26,9 +26,19 @@ FileStorage.blobEncryptionKey, so the provisioning Job only creates the Symmetri
 Job points both settings at it by its id (encryption.blobKey.email / fileStorage), or clears a
 setting that points at it when disabled. A change restarts Stalwart, which loads keys at startup.
 
+Administrator account (adminAccount, `reconcile.py bootstrap`, a Job before the provisioning
+Job): the Jobs log in with an app password of a Stalwart account with the Admin role, accepted
+only from 127.0.0.1 and ::1, so only through the gateway in the Stalwart pod. Nothing is done
+while the recorded password works. Otherwise (first run, database reset, revoked password) the
+Job writes a random recovery administrator (STALWART_RECOVERY_ADMIN) into the account's Secret,
+restarts Stalwart, creates the account and its app password with it, removes the recovery
+administrator again and restarts once more. The regular run then publishes further app
+passwords of the account (adminAccount.clients), like those of the system accounts.
+
 Errors fail the run, which the Job retries; every step can resume. Standard library only.
 Configuration: the JSON file in $CONFIG_FILE; the Stalwart administrator in $STALWART_USER /
-$STALWART_PASSWORD; the Kubernetes API through the projected service account token.
+$STALWART_PASSWORD (not used by the bootstrap); the Kubernetes API through the projected service
+account token.
 """
 import base64
 import ipaddress
@@ -46,6 +56,8 @@ PREFIX = "stalwart.s7n.systems/"
 SETTINGS = PREFIX + "settings"
 CREDENTIAL = PREFIX + "credential"
 LOCK = PREFIX + "lock"
+BOOTSTRAP = PREFIX + "admin-bootstrap"
+RECOVERY_KEY = "STALWART_RECOVERY_ADMIN"
 JMAP_USING = ["urn:ietf:params:jmap:core", "urn:stalwart:jmap"]
 
 
@@ -190,6 +202,34 @@ class Stalwart:
             if "marker" in result.get("created", {}):
                 return result["created"]["marker"]["id"]
         raise Failure(f"writing the settings marker: {result}")
+
+    def ensure_admin_account(self, release, name, domain):
+        """Creates the administrator account and its domain, or restores the Admin role."""
+        ids = self.call("x:Domain/query", {"filter": {"name": domain}})["ids"]
+        if ids:
+            domain_id = ids[0]
+        else:
+            result = self.call("x:Domain/set", {"create": {"d": {"name": domain}}})
+            if "d" not in result.get("created", {}):
+                raise Failure(f"creating the domain {domain}: {result.get('notCreated')}")
+            domain_id = result["created"]["d"]["id"]
+        value = {"description": f"managed:{release}/admin", "roles": {"@type": "Admin"}}
+        address = f"{name}@{domain}"
+        for account in self._accounts(name):
+            if account.get("emailAddress", "").lower() == address.lower():
+                result = self.call("x:Account/set", {"update": {account["id"]: value}})
+                if account["id"] not in result.get("updated", {}):
+                    raise Failure(f"updating the account {address}: {result.get('notUpdated')}")
+                return account["id"]
+        result = self.call("x:Account/set", {"create": {"a": {"@type": "User", "name": name, "domainId": domain_id, **value}}})
+        if "a" not in result.get("created", {}):
+            raise Failure(f"creating the account {address}: {result.get('notCreated')}")
+        log("admin", f"account {address} created")
+        return result["created"]["a"]["id"]
+
+    def _accounts(self, name):
+        ids = self.call("x:Account/query", {"filter": {"name": name}})["ids"]
+        return self.call("x:Account/get", {"ids": ids, "properties": ["emailAddress"]})["list"] if ids else []
 
     def destroy_app_passwords(self, account_id, ids):
         if not ids:
@@ -383,10 +423,130 @@ def reconcile_account(config, account, kube, stalwart):
             log(name, f"could not release the lock (it expires after {config['lockTimeoutSeconds']}s): {e}")
 
 
+# --- Administrator account ----------------------------------------------------------------
+
+def login_accepted(url, user, password, attempts=5, wait=3):
+    """True when Stalwart accepts the login, False when it refuses it. Connection errors are
+    retried: right after a restart the Service may not route to the new pods yet."""
+    req = urllib.request.Request(url.rstrip("/") + "/jmap/session")
+    req.add_header("Authorization", "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode())
+    for attempt in range(1, attempts + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=20):
+                return True
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                return False
+            error = f"HTTP {e.code}"
+        except OSError as e:
+            error = str(e)
+        if attempt < attempts:
+            time.sleep(wait)
+    raise Failure(f"Stalwart at {url}: {error}")
+
+
+def roll(config, kube, stamp):
+    """Restarts Stalwart, so it reads STALWART_RECOVERY_ADMIN again, and waits until it is ready.
+    The stamp stays on the pod template: "recovery@..." while the pods may run with the recovery
+    administrator, "done@..." once a rollout without it was requested."""
+    r = config["restart"]
+    kube.patch_statefulset(r["namespace"], r["statefulset"], {"spec": {"template": {"metadata": {"annotations": {BOOTSTRAP: stamp}}}}})
+    wait_rollout(config, kube)
+
+
+def wait_rollout(config, kube):
+    r = config["restart"]
+    deadline = time.time() + r["timeoutSeconds"]
+    while not rolled_out(kube.get_statefulset(r["namespace"], r["statefulset"])):
+        if time.time() > deadline:
+            raise Failure(f"StatefulSet {r['statefulset']} did not become ready within {r['timeoutSeconds']}s")
+        time.sleep(5)
+
+
+def admin_credential(admin):
+    """The Jobs' app password as a system account entry, for reconcile_account."""
+    return {"id": "admin", "name": admin["name"], "address": admin["address"],
+            "secret": {**admin["secret"], "keys": ["password"]},
+            "appPassword": {"allowedIps": admin["allowedIps"], "permissions": {"@type": "Inherit"}}}
+
+
+def decoded(data, key):
+    return base64.b64decode(data[key]).decode() if data.get(key) else ""
+
+
+def bootstrap(config, kube):
+    admin = config["adminAccount"]
+    url, ns, name = config["stalwartUrl"], admin["secret"]["namespace"], admin["secret"]["name"]
+    data = kube.get_secret(ns, name).get("data") or {}
+    password = decoded(data, "password")
+    if password and login_accepted(url, admin["address"], password):
+        r = config["restart"]
+        statefulset = kube.get_statefulset(r["namespace"], r["statefulset"])
+        stamp = statefulset["spec"]["template"]["metadata"].get("annotations", {}).get(BOOTSTRAP, "")
+        if data.get(RECOVERY_KEY) or stamp.startswith("recovery@"):
+            # An earlier run stopped before the pods restarted without the recovery
+            # administrator (or one was added for an emergency): the pods may still have it.
+            remove_recovery_admin(config, kube)
+        elif not rolled_out(statefulset):
+            # The rollout without it was requested, but may not have finished.
+            log("admin", "waiting for the rollout without the recovery administrator")
+            wait_rollout(config, kube)
+        log("admin", f"account {admin['address']} in place")
+        return
+
+    log("admin", "no working password recorded (first run, database reset or revoked); bootstrapping"
+        if not password else "the recorded password no longer works; bootstrapping")
+    recovery = decoded(data, RECOVERY_KEY)
+    if not recovery:
+        # Random and only in this Secret: used by this Job, removed again below.
+        recovery = f"bootstrap-{secrets.token_hex(4)}:{secrets.token_urlsafe(32)}"
+        secret = kube.get_secret(ns, name)
+        secret["data"] = {**(secret.get("data") or {}), RECOVERY_KEY: base64.b64encode(recovery.encode()).decode()}
+        kube.replace_secret(secret)
+    user, _, recovery_password = recovery.partition(":")
+    if not login_accepted(url, user, recovery_password):
+        log("admin", "restarting Stalwart with a temporary recovery administrator")
+        roll(config, kube, f"recovery@{int(time.time())}")
+        if not login_accepted(url, user, recovery_password):
+            raise Failure("Stalwart does not accept the temporary recovery administrator after the restart")
+
+    stalwart = Stalwart(url, user, recovery_password)
+    stalwart.ensure_admin_account(config["release"], admin["name"], admin["domain"])
+    if password:
+        # A password Stalwart refuses but still knows (e.g. restricted otherwise): replace it.
+        secret = kube.get_secret(ns, name)
+        secret["data"] = {k: v for k, v in (secret.get("data") or {}).items() if k != "password"}
+        kube.replace_secret(secret)
+    reconcile_account({**config, "smtpCheck": None}, admin_credential(admin), kube, stalwart)
+    password = decoded(kube.get_secret(ns, name).get("data") or {}, "password")
+    if not login_accepted(url, admin["address"], password):
+        raise Failure(f"Stalwart refuses the new app password of {admin['address']}")
+    remove_recovery_admin(config, kube)
+    if login_accepted(url, user, recovery_password):
+        raise Failure("Stalwart still accepts the temporary recovery administrator after the restart")
+    log("admin", f"account {admin['address']} in place; recovery administrator removed")
+
+
+def remove_recovery_admin(config, kube):
+    admin = config["adminAccount"]
+    secret = kube.get_secret(admin["secret"]["namespace"], admin["secret"]["name"])
+    secret["data"] = {k: v for k, v in (secret.get("data") or {}).items() if k != RECOVERY_KEY}
+    kube.replace_secret(secret)
+    log("admin", "restarting Stalwart without the temporary recovery administrator")
+    roll(config, kube, f"done@{int(time.time())}")
+
+
 def main():
     with open(os.environ.get("CONFIG_FILE", "/config/config.json")) as f:
         config = json.load(f)
     kube = Kubernetes()
+    if sys.argv[1:] == ["bootstrap"]:
+        try:
+            bootstrap(config, kube)
+        except Failure as e:
+            log("admin", f"FAILED: {e}")
+            sys.exit(1)
+        sys.exit(0)
     stalwart = Stalwart(config["stalwartUrl"], os.environ["STALWART_USER"], os.environ["STALWART_PASSWORD"])
     try:
         force = blob_key(config, stalwart)
@@ -396,9 +556,11 @@ def main():
         log("restart", f"FAILED: {e}")
         sys.exit(1)
     failed = False
-    for account in config["accounts"]:
+    # App passwords of the administrator account for other clients: no SMTP check, they do not send.
+    clients = (config.get("adminAccount") or {}).get("clients", [])
+    for account, account_config in [(a, config) for a in config["accounts"]] + [(c, {**config, "smtpCheck": None}) for c in clients]:
         try:
-            reconcile_account(config, account, kube, stalwart)
+            reconcile_account(account_config, account, kube, stalwart)
         except Failure as e:
             log(account["id"], f"FAILED: {e}")
             failed = True

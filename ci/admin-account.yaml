@@ -1,0 +1,46 @@
+---
+# The administrator account instead of a static administrator: no provisioning credentials,
+# a client of the account in another namespace, the gateway behind the NetworkPolicy.
+dataStore:
+  backend: "rocksdb"
+blobStore:
+  backend: "existing"
+domain: "example.org"
+hostname: "mail.example.org"
+persistence:
+  enabled: true
+  size: "10Gi"
+oidc:
+  enabled: true
+  activate: true
+  issuerUrl: "https://keycloak.example.org/realms/mail"
+certificateReload:
+  enabled: true
+adminAccount:
+  enabled: true
+  gateway:
+    from:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: "provisioning"
+  clients:
+    - id: "connector"
+      secret:
+        name: "stalwart-connector"
+        namespace: "provisioning"
+networkPolicy:
+  enabled: true
+  management:
+    from:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: "ingress-nginx"
+ingress:
+  enabled: true
+  backend: "management"
+  hosts:
+    - host: "mail.example.org"
+      paths:
+        - path: "/"
+          pathType: "Prefix"
+...
