@@ -131,11 +131,44 @@ class ReconcileChecks(unittest.TestCase):
         self.kube.replace_secret.assert_not_called()
         self.stalwart.account_id.assert_not_called()
 
-    def test_conflict_on_lock_does_not_touch_stalwart(self):
+    def test_conflict_on_lock_does_not_change_stalwart(self):
         self.kube.replace_secret.side_effect = r.Failure('conflict')
         with self.assertRaises(r.Failure):
             self.reconcile()
-        self.stalwart.account_id.assert_not_called()
+        self.stalwart.create_app_password.assert_not_called()
+        self.stalwart.update_app_password.assert_not_called()
+        self.stalwart.destroy_app_passwords.assert_not_called()
+
+    def test_nothing_to_change_writes_nothing(self):
+        self.secret['data']['smtpPassword'] = self.secret['data']['password']
+        self.config['smtpCheck'] = {'host': 'smtp', 'port': 2525}
+        with patch.object(r, 'smtp_check') as check:
+            self.reconcile()
+        check.assert_called_once_with(self.config['smtpCheck'], 'mailer@example.org', 'old')
+        self.kube.replace_secret.assert_not_called()
+        self.stalwart.create_app_password.assert_not_called()
+        self.stalwart.update_app_password.assert_not_called()
+        self.stalwart.destroy_app_passwords.assert_not_called()
+
+    def test_any_change_or_held_lock_takes_the_lock(self):
+        self.secret['data']['smtpPassword'] = self.secret['data']['password']
+        cases = {
+            'orphan': lambda: self.stalwart.app_passwords.return_value.append({'id': 'orphan', 'description': 'managed:mail/mailer #lost'}),
+            'restrictions': lambda: self.account['appPassword'].update(permissions=['authenticate']),
+            'key differs': lambda: self.secret['data'].update(smtpPassword='b3RoZXI='),
+            'own lock of a failed pod': lambda: self.secret['metadata']['annotations'].update({r.LOCK: 'this@100'}),
+            'expired lock': lambda: self.secret['metadata']['annotations'].update({r.LOCK: 'other@1'}),
+        }
+        for case, change in cases.items():
+            with self.subTest(case):
+                self.setUp()
+                self.secret['data']['smtpPassword'] = self.secret['data']['password']
+                change()
+                with patch.dict(os.environ, {'JOB_UID': 'this'}), patch.object(r.time, 'time', return_value=1000):
+                    self.reconcile()
+                self.assertGreaterEqual(self.kube.replace_secret.call_count, 2, case)
+                self.assertTrue(self.kube.replace_secret.call_args_list[0].args[0]['metadata']['annotations'][r.LOCK].startswith('this@'))
+                self.assertNotIn(r.LOCK, self.secret['metadata']['annotations'])
 
     def test_kubernetes_conflict_is_reported(self):
         kube = r.Kubernetes.__new__(r.Kubernetes)

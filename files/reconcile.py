@@ -18,8 +18,9 @@ failed. Stalwart reuses the ids of deleted app passwords, so a credential is ide
 random reference in its description ("managed:<release>/<id> #<reference>"), which the Secret
 records in an annotation. Credentials that carry the marker but are not recorded, left by a
 run that died after creating one, are revoked. A lock annotation on the Secret, written with
-optimistic concurrency, serializes runs of different Jobs. Applications that read the Secret
-pick up a new password when they restart.
+optimistic concurrency, serializes runs of different Jobs; a run that finds nothing to change
+leaves the Secret untouched. Applications that read the Secret pick up a new password when
+they restart.
 
 Blob encryption key: Stalwart (1.0.3 to 1.1.0) does not resolve plan references in Email and
 FileStorage.blobEncryptionKey, so the provisioning Job only creates the SymmetricKey, and this
@@ -314,11 +315,7 @@ def restart(config, kube, stalwart, force=False):
         role_id = stalwart.set_settings_marker(config["release"], role_id, "pending", stamp)
     if applied != stamp:
         kube.patch_statefulset(r["namespace"], r["statefulset"], {"spec": {"template": {"metadata": {"annotations": {SETTINGS: stamp}}}}})
-    deadline = time.time() + r["timeoutSeconds"]
-    while not rolled_out(kube.get_statefulset(r["namespace"], r["statefulset"])):
-        if time.time() > deadline:
-            raise Failure(f"StatefulSet {r['statefulset']} did not become ready within {r['timeoutSeconds']}s")
-        time.sleep(5)
+    wait_rollout(config, kube)
     stalwart.set_settings_marker(config["release"], role_id, "done", stamp)
     log("restart", "settings applied")
 
@@ -334,10 +331,30 @@ def normalized_networks(networks):
     return result
 
 
+def managed_app_passwords(stalwart, account_id, marker, current):
+    """(reference -> app password, ids to revoke) of the account's app passwords that carry
+    the marker. One without a reference, or with one the Secret does not record, is an orphan."""
+    managed, orphans = {}, []
+    for p in stalwart.app_passwords(account_id):
+        description = p.get("description") or ""
+        if description == marker:
+            orphans.append(p["id"])
+        elif description.startswith(marker + " #"):
+            managed[description[len(marker) + 2:]] = p
+    orphans += [p["id"] for ref, p in managed.items() if ref != current]
+    return managed, orphans
+
+
+def restrictions_match(existing, wanted):
+    return (normalized_networks(existing.get("allowedIps") or {}) == normalized_networks(wanted["allowedIps"])
+            and existing.get("permissions") == wanted["permissions"])
+
+
 def reconcile_account(config, account, kube, stalwart):
     name, address = account["id"], account["address"]
     marker = f"managed:{config['release']}/{account['id']}"
     ns, secret_name = account["secret"]["namespace"], account["secret"]["name"]
+    keys = account["secret"]["keys"]
     # The lock belongs to the Job, so its retried pods continue where a failed one stopped.
     owner = os.environ.get("JOB_UID") or os.environ.get("HOSTNAME", "job")
     holder = f"{owner}@{int(time.time())}"
@@ -349,28 +366,33 @@ def reconcile_account(config, account, kube, stalwart):
         held_by, _, held_since = held.rpartition("@")
         if held_by != owner and int(held_since) > time.time() - config["lockTimeoutSeconds"]:
             raise Failure(f"Secret {ns}/{secret_name} is locked by another run ({held})")
+
+    account_id = stalwart.account_id(account["name"], address)
+    if not held:
+        # Nothing to change (the usual case): skip the lock, which costs two Secret writes.
+        current = annotations.get(CREDENTIAL, "")
+        managed, orphans = managed_app_passwords(stalwart, account_id, marker, current)
+        values = {(secret.get("data") or {}).get(k) for k in keys}
+        if (current in managed and not orphans and len(values) == 1 and None not in values and "" not in values
+                and restrictions_match(managed[current], account["appPassword"])):
+            if config.get("smtpCheck"):
+                smtp_check(config["smtpCheck"], address, base64.b64decode(values.pop()).decode())
+            log(name, f"credential {current} in place")
+            return
+
     annotations[LOCK] = holder
     secret = kube.replace_secret(secret)
 
     try:
-        account_id = stalwart.account_id(account["name"], address)
         current = secret["metadata"]["annotations"].get(CREDENTIAL, "")
-        # Managed app passwords: reference -> app password. One without a reference is an orphan.
-        managed, orphans = {}, []
-        for p in stalwart.app_passwords(account_id):
-            description = p.get("description") or ""
-            if description == marker:
-                orphans.append(p["id"])
-            elif description.startswith(marker + " #"):
-                managed[description[len(marker) + 2:]] = p
+        # Read again under the lock: another run may have changed them meanwhile.
+        managed, orphans = managed_app_passwords(stalwart, account_id, marker, current)
         # Credentials of a run that died before recording them can never be used: revoke them.
-        orphans += [p["id"] for ref, p in managed.items() if ref != current]
         if orphans:
             log(name, f"revoking {len(orphans)} unrecorded credential(s) of interrupted runs")
             stalwart.destroy_app_passwords(account_id, orphans)
 
         data = secret.get("data") or {}
-        keys = account["secret"]["keys"]
         stored = next((data[k] for k in keys if data.get(k)), None)
         if current in managed and not stored:
             # The Secret lost the password; Stalwart cannot show it again.
@@ -381,8 +403,7 @@ def reconcile_account(config, account, kube, stalwart):
             # existing app password, which keeps its secret.
             existing = managed[current]
             wanted = account["appPassword"]
-            if (normalized_networks(existing.get("allowedIps") or {}) != normalized_networks(wanted["allowedIps"])
-                    or existing.get("permissions") != wanted["permissions"]):
+            if not restrictions_match(existing, wanted):
                 stalwart.update_app_password(account_id, existing["id"], {
                     "allowedIps": {ip: True for ip in wanted["allowedIps"]}, "permissions": wanted["permissions"]})
                 log(name, f"restrictions of credential {current} updated")

@@ -1,5 +1,11 @@
 # Upgrading
 
+## Chart 0.7.1: stalwart-cli 2.0.0
+
+No steps are needed. The provisioning Job and the certificate reload CronJob run `stalwart-cli` 2.0.0, which leaves Stalwart in the same state as 1.0.14 for the chart's settings. Only the log wording changed, e.g. `Done: 11 updated, 6 created` instead of `Done: 0 destroyed, 11 updated, 6 created (0 failed)`. If `provisioning.extraPlan` has failing entries, their errors now span indented lines. See the [release notes](https://github.com/stalwartlabs/cli/releases/tag/v2.0.0).
+
+The reconcile Job no longer locks and rewrites a system account's Secret when its credential is already in place, so an upgrade that changes nothing about the accounts leaves their Secrets untouched.
+
 ## Chart 0.7.0: administrator account
 
 No steps are needed. New: `adminAccount`, an administrator for the chart's Jobs without a static password. See [Administrator account](../README.md#administrator-account).

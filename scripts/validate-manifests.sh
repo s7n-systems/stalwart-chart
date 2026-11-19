@@ -8,7 +8,7 @@ set -euo pipefail
 chart="$(cd "$(dirname "$0")/.." && pwd)"
 rendered="${1:-$chart/rendered}"
 
-KYVERNO=ghcr.io/kyverno/kyverno-cli:v1.19.2@sha256:322ec5044d600930cb3af0e56dc33154a2d1d1fba58f4cadad3f47be7e78b11c
+KYVERNO=ghcr.io/kyverno/kyverno-cli:v1.20.0@sha256:bd2b8b7c9d550ecf04e0bacaf351adce2f82ce67fd3f291075edcee7f8ab4ab4
 KUBECONFORM=ghcr.io/yannh/kubeconform:v0.8.0@sha256:faffaf43f95aa6425306e1ab8d6fcad72acb9049158f38e574c085ea1ec0f64e
 # Schemas of the custom resources the chart renders (HTTPRoute, TCPRoute, ServiceMonitor,
 # Certificate), from the community catalog at a pinned commit. A kind without a schema fails.
