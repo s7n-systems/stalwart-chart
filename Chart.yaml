@@ -3,7 +3,7 @@ apiVersion: "v2"
 name: "stalwart"
 description: "Helm chart for the Stalwart mail and collaboration server, with optional Bulwark webmail"
 type: "application"
-version: "0.7.0"
+version: "0.7.1"
 # Kept in step with image.tag in values.yaml.
 # renovate: image=docker.io/stalwartlabs/stalwart
 appVersion: "v1.1.1"
@@ -39,7 +39,7 @@ annotations:
   artifacthub.io/license: "Apache-2.0"
   artifacthub.io/category: "networking"
   artifacthub.io/prerelease: "false"
-  artifacthub.io/containsSecurityUpdates: "true"
+  artifacthub.io/containsSecurityUpdates: "false"
   artifacthub.io/links: |
     - name: "Stalwart documentation"
       url: "https://stalw.art/docs"
@@ -51,14 +51,17 @@ annotations:
     - name: "stalwart"
       image: "docker.io/stalwartlabs/stalwart:v1.1.1@sha256:5ebdf474b237161742fe4309396af4ae8797c938e8e6eb7e2d4837332c4f9851"
     - name: "stalwart-cli"
-      image: "ghcr.io/stalwartlabs/cli:1.0.14@sha256:5b70732cb69cdab3ff0894c501544cf0bfa180fa75bcd0eeba4eebe04c1064e1"
+      image: "ghcr.io/stalwartlabs/cli:2.0.0@sha256:8588aa3ea88ed740f83292ab37760869541df3da39cd1c8e6494fb43ece888c9"
     - name: "python"
       image: "docker.io/library/python:3.15-alpine@sha256:0f9552bb28711333da16915ec146f5e6bb44a7fdac9ced15dc17c2e0206346dd"
     - name: "bulwark"
       image: "ghcr.io/bulwarkmail/webmail:1.21.2@sha256:037b85b1433233d2d7eebb83f928df5ecc3b4adc91dc7e4c55f0a2f69024e754"
   artifacthub.io/changes: |
-    - kind: "added"
-      description: "adminAccount: the Jobs log in with an app password that Stalwart accepts only from inside its pod, through a gateway container, instead of a static administrator password"
-    - kind: "security"
-      description: "No static administrator needed: the recovery administrator works over HTTPS, IMAP and SMTP from any address"
+    - kind: "changed"
+      description: "stalwart-cli 2.0.0 for the provisioning Job and the certificate reload; the chart's plans leave Stalwart in the same state as with 1.0.14"
+      links:
+        - name: "stalwart-cli 2.0.0"
+          url: "https://github.com/stalwartlabs/cli/releases/tag/v2.0.0"
+    - kind: "changed"
+      description: "The reconcile Job no longer writes a system account's Secret when its credential is already in place"
 ...

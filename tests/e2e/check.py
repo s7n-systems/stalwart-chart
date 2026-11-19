@@ -322,7 +322,10 @@ check("restarted although the hash on the StatefulSet is unchanged", statefulset
 check("marker recorded again", marker() == config["restart"]["settingsHash"])
 data7, ann7 = secret("mailer-smtp")
 check("account recreated with a new credential", ann7.get("credential") not in (reference, None) and smtp_login(ADDRESS, data7.get("password", "")))
+version = kubectl("-n", "mail", "get", "secret", "mailer-smtp", "-o", "jsonpath={.metadata.resourceVersion}")
 check("job again: nothing to do", run_job(config) == 0 and statefulset()[0] == generation_before + 1 and secret("mailer-smtp")[1]["credential"] == ann7["credential"])
+check("nothing to do: the Secret is not written (no lock)",
+      kubectl("-n", "mail", "get", "secret", "mailer-smtp", "-o", "jsonpath={.metadata.resourceVersion}") == version)
 
 print("-- existing Secret (secret.create: false), in another namespace")
 kubectl("-n", "apps", "create", "secret", "generic", "precreated", "--from-literal=unrelated=keep-me")

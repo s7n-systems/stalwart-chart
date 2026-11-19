@@ -221,11 +221,11 @@ provisioning:
     repository: "stalwartlabs/cli"
     # -- Image tag, kept in sync with the digest by Renovate.
     # @default -- pinned, see values.yaml
-    tag: "1.0.14"
+    tag: "2.0.0"
     # -- Multi-arch index digest of the tag. Takes precedence over the tag;
     # clear it to float on the tag instead.
     # @default -- pinned, see values.yaml
-    digest: "sha256:5b70732cb69cdab3ff0894c501544cf0bfa180fa75bcd0eeba4eebe04c1064e1"
+    digest: "sha256:8588aa3ea88ed740f83292ab37760869541df3da39cd1c8e6494fb43ece888c9"
     pullPolicy: "IfNotPresent"
     pullSecrets: []
   username: "admin"
